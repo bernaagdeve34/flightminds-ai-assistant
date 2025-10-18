@@ -9,7 +9,7 @@ const nextConfig: NextConfig = {
     // ✅ Lint hatalarını da yok say
     ignoreDuringBuilds: true,
   },
-  output: "export", // (isteğe bağlı, GitHub Pages veya statik export için)
+ // output: "export", // (isteğe bağlı, GitHub Pages veya statik export için)
 };
 
 export default nextConfig;
