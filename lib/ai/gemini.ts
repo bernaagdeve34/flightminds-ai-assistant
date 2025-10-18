@@ -6,7 +6,10 @@ export interface NluResult {
 
 export async function extractQueryWithGemini(query: string): Promise<NluResult | null> {
 	const apiKey = process.env.GEMINI_API_KEY;
-	if (!apiKey) return null;
+	if (!apiKey) {
+		console.log("[Gemini] API key missing; skipping NLU");
+		return null;
+	}
 
 	// Minimal JSON-extraction prompt for Gemini 1.5 via REST
 	const system =
@@ -28,14 +31,22 @@ export async function extractQueryWithGemini(query: string): Promise<NluResult |
 				}),
 			}
 		);
-		if (!resp.ok) return null;
+		if (!resp.ok) {
+			console.log("[Gemini] HTTP", resp.status, await resp.text());
+			return null;
+		}
 		const data = await resp.json();
 		const text = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
-		if (!text) return null;
+		if (!text) {
+			console.log("[Gemini] Empty response body");
+			return null;
+		}
 		const jsonText = text.replace(/```json|```/g, "").trim();
 		const parsed = JSON.parse(jsonText);
+		console.log("[Gemini] Parsed NLU:", parsed);
 		return parsed as NluResult;
 	} catch {
+		console.log("[Gemini] Exception while calling API");
 		return null;
 	}
 }

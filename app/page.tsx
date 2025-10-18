@@ -5,24 +5,14 @@ import FlightTable from "@/components/FlightTable";
 import AssistantPanel from "@/components/AssistantPanel";
 import SplashIntro from "@/components/SplashIntro";
 import { byTime } from "@/lib/utils";
-
-type Flight = {
-  id: string;
-  airportCode: string;
-  flightNumber: string;
-  airline: string;
-  direction: "Departure" | "Arrival";
-  originCity: string;
-  destinationCity: string;
-  scheduledTimeLocal: string;
-  estimatedTimeLocal?: string;
-  status: string;
-};
+import { i18n } from "@/lib/i18n";
+import type { Flight } from "@/lib/types";
 
 export default function Home() {
   const [lang, setLang] = React.useState<Lang>("tr");
   const [allFlights, setAllFlights] = React.useState<Flight[]>([]);
   const [showIntro, setShowIntro] = React.useState(true);
+  const t = i18n[lang];
 
   React.useEffect(() => {
     fetch("/api/flights")
@@ -36,23 +26,24 @@ export default function Home() {
   const departures = allFlights.filter((f) => f.direction === "Departure").sort(byTime);
   const arrivals = allFlights.filter((f) => f.direction === "Arrival").sort(byTime);
   return (
-    <div className="min-h-screen bg-gray-100">
+    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-fuchsia-50">
       {showIntro && <SplashIntro language={lang} onDone={() => setShowIntro(false)} />}
-      <header className="flex items-center justify-between px-6 py-4 border-b bg-white">
-        <h1 className="text-lg font-semibold">İstanbul Havalimanı Uçuş Asistanı</h1>
+      <header className="flex items-center justify-between px-6 py-4 border-b bg-white/80 backdrop-blur">
+        <h1 className="text-lg font-semibold">{t.pageTitle}</h1>
         <LanguageSwitch value={lang} onChange={setLang} />
       </header>
-      <main className="px-6 py-6 grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-1">
-          <FlightTable title={lang === "tr" ? "Giden Uçuşlar" : "Departures"} flights={departures} />
+      <main className="px-6 py-8 max-w-[1280px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+        <div className="lg:col-span-3">
+          <FlightTable title={t.departures} flights={departures} language={lang} />
         </div>
-        <div className="lg:col-span-1">
+        <div className="lg:col-span-6">
           <AssistantPanel language={lang} />
         </div>
-        <div className="lg:col-span-1">
-          <FlightTable title={lang === "tr" ? "Gelen Uçuşlar" : "Arrivals"} flights={arrivals} />
+        <div className="lg:col-span-3">
+          <FlightTable title={t.arrivals} flights={arrivals} language={lang} />
         </div>
       </main>
     </div>
   );
 }
+

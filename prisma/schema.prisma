@@ -37,6 +37,10 @@ model Flight {
   scheduledTimeLocal String
   estimatedTimeLocal String?
   status             FlightStatus
+  source             String?
+  fetchedAt          DateTime?
   createdAt          DateTime?
   updatedAt          DateTime?
+
+  @@index([fetchedAt])
 }
