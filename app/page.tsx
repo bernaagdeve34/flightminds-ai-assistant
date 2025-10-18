@@ -28,8 +28,14 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-fuchsia-50">
       {showIntro && <SplashIntro language={lang} onDone={() => setShowIntro(false)} />}
-      <header className="flex items-center justify-between px-6 py-4 border-b bg-white/80 backdrop-blur">
-        <h1 className="text-lg font-semibold">{t.pageTitle}</h1>
+      <header
+        className="flex items-center justify-between px-6 py-3 text-white"
+        style={{ background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" }}
+      >
+        <div className="flex items-center gap-3">
+          <img src="/ist_logtwo.png" alt="IST" className="h-8 w-8 object-contain" />
+          <h1 className="text-lg font-semibold">{t.pageTitle}</h1>
+        </div>
         <LanguageSwitch value={lang} onChange={setLang} />
       </header>
       <main className="px-6 py-8 max-w-[1280px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">

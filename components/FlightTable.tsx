@@ -46,12 +46,12 @@ export default function FlightTable({ title, flights, language = "tr" }: Props) 
     }
 
     return (
-        <div className="bg-white/95 backdrop-blur-sm border border-white/60 rounded-2xl shadow-lg overflow-hidden">
+        <div className="card-surface overflow-hidden">
             <div className="px-4 pt-4 font-semibold text-gray-900">{title}</div>
             <div className="px-4 pb-3">
                 <div className="flex items-center justify-between">
-                    <div className="h-2 w-full rounded-full bg-purple-200 relative overflow-hidden">
-                        <div className="absolute inset-y-0 left-0 w-2/3 bg-purple-600"></div>
+                    <div className="h-2 w-full rounded-full bg-white/50 relative overflow-hidden">
+                        <div className="absolute inset-y-0 left-0 w-2/3 rounded-full ist-bar"></div>
                     </div>
                     <div className="ml-3 text-xs font-medium text-gray-700 whitespace-nowrap">
                         {todayLabel}

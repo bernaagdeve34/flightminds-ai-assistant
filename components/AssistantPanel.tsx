@@ -90,15 +90,24 @@ export default function AssistantPanel({ language }: Props) {
 	}, [answer, speakEnabled, speak]);
 
 	return (
-		<div className="relative bg-gradient-to-br from-indigo-600/60 via-purple-600/60 to-fuchsia-600/60 rounded-3xl p-8 text-white shadow-xl min-h-[420px] flex flex-col items-center justify-center gap-6">
+		<div
+			className="relative rounded-3xl p-8 text-white shadow-xl min-h-[420px] flex flex-col items-center justify-center gap-6"
+			style={{
+				background: "linear-gradient(135deg, rgba(0,179,164,0.85) 0%, rgba(0,198,215,0.85) 100%)",
+			}}
+		>
 			<div className="text-center">
 				<div className="text-2xl font-semibold">{t.heroTitle}</div>
 				<div className="opacity-90 mt-1">{t.heroSubtitle}</div>
 			</div>
 			<button
 				onClick={startListening}
-				className={`h-28 w-28 rounded-full flex items-center justify-center shadow-lg transition-transform ${listening ? "bg-rose-500 scale-105" : "bg-white text-purple-700"}`}
+				className={`h-28 w-28 rounded-full flex items-center justify-center shadow-lg transition-transform border ${
+					listening ? "scale-105"
+					: "bg-white"
+				}`}
 				title={listening ? t.listening : t.micStart}
+				style={listening ? { background: "var(--ist-teal)" } : { borderColor: "rgba(0,0,0,0.05)" }}
 			>
 				<svg
 					width="48"
@@ -106,7 +115,8 @@ export default function AssistantPanel({ language }: Props) {
 					viewBox="0 0 24 24"
 					fill="none"
 					xmlns="http://www.w3.org/2000/svg"
-					className={`${listening ? "text-white" : "text-purple-700"}`}
+					className={listening ? "text-white" : ""}
+					style={listening ? undefined : { color: "var(--ist-teal)" }}
 				>
 					<path d="M12 14c1.654 0 3-1.346 3-3V6c0-1.654-1.346-3-3-3S9 4.346 9 6v5c0 1.654 1.346 3 3 3z" fill="currentColor"/>
 					<path d="M19 11a1 1 0 10-2 0 5 5 0 11-10 0 1 1 0 10-2 0 7 7 0 0012 0z" fill="currentColor"/>
@@ -123,7 +133,8 @@ export default function AssistantPanel({ language }: Props) {
 					/>
 					<button
 						onClick={() => input && sendQuery(input)}
-						className="px-4 py-2 rounded-lg bg-gray-900 text-white hover:bg-black"
+						className="px-4 py-2 rounded-lg text-white"
+						style={{ background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" }}
 					>
 						{t.send}
 					</button>

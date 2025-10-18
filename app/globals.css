@@ -3,6 +3,11 @@
 :root {
   --background: #ffffff;
   --foreground: #171717;
+  --foreground-rgb: 12, 18, 24;
+  --background-rgb: 250, 252, 253;
+  /* Istanbul Airport palette (from logo) */
+  --ist-teal: #00B3A4;
+  --ist-cyan: #00C6D7;
 }
 
 @theme inline {
@@ -20,7 +25,20 @@
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
+  color: rgb(var(--foreground-rgb));
+  background: linear-gradient(135deg, var(--ist-teal) 0%, var(--ist-cyan) 100%);
   font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Cards / panels */
+.card-surface {
+  background: rgba(255,255,255,0.96);
+  border: 1px solid rgba(255,255,255,0.6);
+  border-radius: 16px;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.05);
+}
+
+/* IST branded bar */
+.ist-bar {
+  background: linear-gradient(90deg, var(--ist-teal), var(--ist-cyan));
 }
