@@ -17,15 +17,27 @@ export async function fetchIstFlightsFromAviationstack(targetDate?: string): Pro
   const flight_date = targetDate ?? `${yyyy}-${mm}-${dd}`;
 
   const base = `${scheme}://${host}/v1/flights`;
-  const qsDep = new URLSearchParams({ access_key: key, dep_icao: "LTFM", flight_date, limit: "100" });
-  const qsArr = new URLSearchParams({ access_key: key, arr_icao: "LTFM", flight_date, limit: "100" });
-  const urlDep = `${base}?${qsDep.toString()}`;
-  const urlArr = `${base}?${qsArr.toString()}`;
+  const urlsDep: string[] = [
+    `${base}?${new URLSearchParams({ access_key: key, dep_icao: "LTFM", flight_date, limit: "100" }).toString()}`,
+    `${base}?${new URLSearchParams({ access_key: key, dep_iata: "IST",  flight_date, limit: "100" }).toString()}`,
+  ];
+  const urlsArr: string[] = [
+    `${base}?${new URLSearchParams({ access_key: key, arr_icao: "LTFM", flight_date, limit: "100" }).toString()}`,
+    `${base}?${new URLSearchParams({ access_key: key, arr_iata: "IST",  flight_date, limit: "100" }).toString()}`,
+  ];
 
   async function safe(url: string): Promise<any[]> {
     try {
-      const res = await fetch(url);
-      if (!res.ok) return [];
+      const ac = new AbortController();
+      const t = setTimeout(() => ac.abort(), 2500);
+      const res = await fetch(url, { signal: ac.signal }).catch((e) => {
+        return new Response(null, { status: 599, statusText: String(e) }) as any;
+      });
+      clearTimeout(t);
+      if (!res.ok) {
+        console.log("[Aviationstack] non-OK", res.status, url);
+        return [];
+      }
       const json = await res.json();
       const data = (json?.data ?? []) as any[];
       return Array.isArray(data) ? data : [];
@@ -34,7 +46,27 @@ export async function fetchIstFlightsFromAviationstack(targetDate?: string): Pro
     }
   }
 
-  const [depRaw, arrRaw] = await Promise.all([safe(urlDep), safe(urlArr)]);
+  // Query ICAO and IATA in parallel and take the first non-empty
+  let depRaw: any[] = [];
+  let arrRaw: any[] = [];
+  {
+    const [d1, d2] = await Promise.all([safe(urlsDep[0]), safe(urlsDep[1])]);
+    depRaw = d1.length ? d1 : d2;
+    const [a1, a2] = await Promise.all([safe(urlsArr[0]), safe(urlsArr[1])]);
+    arrRaw = a1.length ? a1 : a2;
+  }
+
+  // Fallback: try without date (live) and status variants if still empty
+  if (arrRaw.length === 0 || depRaw.length === 0) {
+    const status = "active";
+    const a1 = `${base}?${new URLSearchParams({ access_key: key, arr_icao: "LTFM", flight_status: status, limit: "100" }).toString()}`;
+    const a2 = `${base}?${new URLSearchParams({ access_key: key, arr_iata: "IST",  flight_status: status, limit: "100" }).toString()}`;
+    const d1 = `${base}?${new URLSearchParams({ access_key: key, dep_icao: "LTFM", flight_status: status, limit: "100" }).toString()}`;
+    const d2 = `${base}?${new URLSearchParams({ access_key: key, dep_iata: "IST",  flight_status: status, limit: "100" }).toString()}`;
+    const [ar1, ar2, dr1, dr2] = await Promise.all([safe(a1), safe(a2), safe(d1), safe(d2)]);
+    if (!arrRaw.length) arrRaw = ar1.length ? ar1 : ar2;
+    if (!depRaw.length) depRaw = dr1.length ? dr1 : dr2;
+  }
 
   function toIso(x?: string | null): string | undefined {
     if (!x) return undefined;

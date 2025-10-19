@@ -41,6 +41,19 @@ export default function SplashIntro({ language, durationMs = 6000, onDone }: Pro
 					<div className="h-28 w-28 relative drop-shadow-lg">
 						<img src="/ist_logo.png" alt="IST" className="h-28 w-28 object-contain" />
 					</div>
+					{/* Guidance icons row */}
+					<div className="mt-1 flex items-center gap-4">
+						<img
+							src="/yonlendirme1.jpg"
+							alt="guidance-1"
+							className="h-12 w-12 rounded-md object-cover drop-shadow-lg opacity-95 guidance-float"
+						/>
+						<img
+							src="/yonlendirme2.jpg"
+							alt="guidance-2"
+							className="h-12 w-12 rounded-md object-cover drop-shadow-lg opacity-95 guidance-float [animation-delay:0.6s]"
+						/>
+					</div>
 					<div className="flex gap-2">
 						<span className="w-2 h-2 rounded-full bg-white/70 animate-bounce [animation-delay:-0.45s]"></span>
 						<span className="w-2 h-2 rounded-full bg-white/70 animate-bounce [animation-delay:-0.3s]"></span>
@@ -59,7 +72,9 @@ export default function SplashIntro({ language, durationMs = 6000, onDone }: Pro
 			<style jsx>{`
 			@keyframes progress { 0% { transform: translateX(-120%);} 50% { transform: translateX(0);} 100% { transform: translateX(120%);} }
 			@keyframes plane-loop { 0% { transform: translateX(-20vw) translateY(0) rotate(-6deg);} 50% { transform: translateX(0) translateY(-4px) rotate(0deg);} 100% { transform: translateX(20vw) translateY(0) rotate(6deg);} }
+			@keyframes guidance-float { 0% { transform: translateY(0) rotate(-2deg);} 50% { transform: translateY(-6px) rotate(0);} 100% { transform: translateY(0) rotate(2deg);} }
 			.plane-anim { width: 40px; height: 40px; left: 50%; transform: translateX(-50%); animation: plane-loop 3.2s ease-in-out infinite; }
+			.guidance-float { animation: guidance-float 2.4s ease-in-out infinite; }
 			`}</style>
 		</div>
 	);

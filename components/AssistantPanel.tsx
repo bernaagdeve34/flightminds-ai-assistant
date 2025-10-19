@@ -91,7 +91,7 @@ export default function AssistantPanel({ language }: Props) {
 
 	return (
 		<div
-			className="relative rounded-3xl p-8 text-white shadow-xl min-h-[420px] flex flex-col items-center justify-center gap-6"
+			className="relative rounded-3xl p-6 text-white shadow-xl min-h-[360px] flex flex-col items-center justify-center gap-5"
 			style={{
 				background: "linear-gradient(135deg, rgba(0,179,164,0.85) 0%, rgba(0,198,215,0.85) 100%)",
 			}}
@@ -102,7 +102,7 @@ export default function AssistantPanel({ language }: Props) {
 			</div>
 			<button
 				onClick={startListening}
-				className={`h-28 w-28 rounded-full flex items-center justify-center shadow-lg transition-transform border ${
+				className={`h-20 w-20 rounded-full flex items-center justify-center shadow-lg transition-transform border ${
 					listening ? "scale-105"
 					: "bg-white"
 				}`}
@@ -110,8 +110,8 @@ export default function AssistantPanel({ language }: Props) {
 				style={listening ? { background: "var(--ist-teal)" } : { borderColor: "rgba(0,0,0,0.05)" }}
 			>
 				<svg
-					width="48"
-					height="48"
+					width="36"
+					height="36"
 					viewBox="0 0 24 24"
 					fill="none"
 					xmlns="http://www.w3.org/2000/svg"
@@ -123,7 +123,7 @@ export default function AssistantPanel({ language }: Props) {
 					<path d="M11 19.938V22h2v-2.062A7.01 7.01 0 0012 20c-.34 0-.674-.022-1-.062z" fill="currentColor"/>
 				</svg>
 			</button>
-			<div className="w-full max-w-xl bg-white/15 backdrop-blur-md rounded-2xl p-3">
+			<div className="w-full max-w-lg bg-white/15 backdrop-blur-md rounded-2xl p-3">
 				<div className="flex gap-2">
 					<input
 						value={input}
