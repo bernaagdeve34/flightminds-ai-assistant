@@ -41,6 +41,7 @@ function statusClass(s: string) {
 export default function RichFlightTable({ title, flights, language = "tr" }: Props) {
   const t = i18n[language];
   const dateLabel = formatDateLabel(language);
+  const tableDirection = flights[0]?.direction ?? "Departure";
 
   return (
     <div className="card-surface overflow-hidden">
@@ -60,7 +61,7 @@ export default function RichFlightTable({ title, flights, language = "tr" }: Pro
               <th className="px-3 py-2">{language === "tr" ? "Hava Yolu" : "Airline"}</th>
               <th className="px-3 py-2">{language === "tr" ? "Uçuş No" : "Flight No"}</th>
               <th className="px-3 py-2">{language === "tr" ? "Kalkış / Varış" : "Origin / Dest"}</th>
-              <th className="px-3 py-2">{language === "tr" ? "Bagaj" : "Baggage"}</th>
+              <th className="px-3 py-2">{tableDirection === "Arrival" ? (language === "tr" ? "Bagaj" : "Baggage") : (language === "tr" ? "Kapı" : "Gate")}</th>
               <th className="px-3 py-2">{t.headers.status}</th>
             </tr>
           </thead>
@@ -72,7 +73,7 @@ export default function RichFlightTable({ title, flights, language = "tr" }: Pro
                 <td className="px-3 py-2">{f.airline}</td>
                 <td className="px-3 py-2 font-semibold">{f.flightNumber}</td>
                 <td className="px-3 py-2">{f.direction === "Arrival" ? f.originCity : f.destinationCity}</td>
-                <td className="px-3 py-2">-</td>
+                <td className="px-3 py-2">{f.direction === "Arrival" ? (f.baggage ?? "-") : (f.gate ?? "-")}</td>
                 <td className={`px-3 py-2 font-medium ${statusClass(f.status)}`}>{f.status}</td>
               </tr>
             ))}

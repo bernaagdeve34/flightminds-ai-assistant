@@ -2,9 +2,7 @@ import { NextRequest } from "next/server";
 import { flights as staticFlights } from "@/lib/data/flights";
 import { filterFlights } from "@/lib/utils";
 import { fetchFlightsFromDb } from "@/lib/db/flights";
-import type { Flight } from "@/lib/types";
-import { fetchIstFlightsFromAviationstack } from "@/lib/api/providers/aviationstack";
-import { fetchIstFlightsFromAeroDataBox } from "@/lib/api/providers/aerodatabox";
+import type { Flight, FlightDirection } from "@/lib/types";
 import { extractQueryWithGemini, extractQueryWithGeminiMeta } from "@/lib/ai/gemini";
 import { extractQueryWithGroq, extractQueryWithGroqMeta } from "@/lib/ai/groq";
 import { extractQueryWithRules } from "@/lib/ai/rules";
@@ -41,11 +39,16 @@ export async function POST(req: NextRequest) {
   const flightNumber = nlu?.flightNumber;
 
   // 2) Fallback: naive regex
-  const normalized = query.toLowerCase();
-  const isArrival = /gelen|var(ış|acak)|arriv(e|al)/.test(normalized);
-  const isDeparture = /giden|kalk(ış|acak)|depart/.test(normalized);
-  const flightNumMatch = normalized.match(/([a-z]{2}\d{2,4})/i);
-  const cityMatch = normalized.match(/\b([a-zçğıöşü]{3,})\b/iu);
+  const strip = (s: string) => s
+    .toLocaleLowerCase(lang === "tr" ? "tr-TR" : "en-US")
+    .normalize("NFD").replace(/\p{Diacritic}/gu, "").replace(/[^a-z0-9\s]/gi, " ")
+    .replace(/\s+/g, " ").trim();
+  const normalized = strip(query);
+  const isArrival = /(gelen|varis|varacak|arrival|arrive|arriving)/.test(normalized);
+  const isDeparture = /(giden|kalkis|kalkacak|departure|depart)/.test(normalized);
+  // Accept TK2695, TK 2695, tk2695 etc.
+  const flightNumMatch = normalized.match(/\b([a-z]{2})\s?(\d{2,4})\b/i);
+  const cityMatch = normalized.match(/\b([a-z]{3,})\b/i);
 
   const merged = {
     city: city ?? cityMatch?.[1],
@@ -53,67 +56,73 @@ export async function POST(req: NextRequest) {
     flightNumber: flightNumber ?? flightNumMatch?.[1],
   };
 
-  // 0) Build flight list: try disk cache first, then providers
+  // 0) Build flight list from ISTAirport live proxy (both directions, domestic & international)
   async function loadLiveFlights(): Promise<Flight[]> {
-    const now = new Date();
-    const yyyy = now.getFullYear();
-    const mm = String(now.getMonth() + 1).padStart(2, "0");
-    const dd = String(now.getDate()).padStart(2, "0");
-    const date = `${yyyy}-${mm}-${dd}`;
+    const directions: Array<{ nature: string; direction: FlightDirection }> = [
+      { nature: "1", direction: "Departure" },
+      { nature: "0", direction: "Arrival" },
+    ];
+    const scopes = ["0", "1"]; // 0: domestic, 1: international
 
-    // a) Try disk cache from API routes (fast & quota-free)
-    const arrDisk = await readJson<{ rows: any[] }>(`arrivals:${date}`, 30 * 60 * 1000);
-    const depDisk = await readJson<{ rows: any[] }>(`departures:${date}`, 30 * 60 * 1000);
-    const fromDisk: Flight[] = [];
-    for (const r of arrDisk.data?.rows ?? []) {
-      fromDisk.push({
-        id: `${r.flightNumber}-arr-${r.scheduled}`,
-        airportCode: "IST",
-        flightNumber: String(r.flightNumber || ""),
-        airline: String(r.airline || ""),
-        direction: "Arrival",
-        originCity: String(r.departureAirport || ""),
-        destinationCity: "Istanbul",
-        scheduledTimeLocal: r.scheduled,
-        estimatedTimeLocal: r.estimated,
-        status: String(r.status || "On Time") as any,
-        source: "cache:api:arrivals",
-        fetchedAt: new Date().toISOString() as any,
-        createdAt: new Date().toISOString() as any,
-        updatedAt: new Date().toISOString() as any,
-      } as Flight);
+    const results: Flight[] = [];
+    for (const d of directions) {
+      for (const isInternational of scopes) {
+        const body = new URLSearchParams({
+          nature: d.nature,
+          searchTerm: "",
+          pageSize: "100",
+          isInternational,
+          date: "",
+          endDate: "",
+          culture: lang === "tr" ? "tr" : "en",
+          clickedButton: "",
+        }).toString();
+        try {
+          const resp = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/istairport/status`, {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            cache: "no-store",
+            body,
+          });
+          const json = await resp.json().catch(() => ({} as any));
+          const flights: any[] = (json?.data ?? json)?.result?.data?.flights || [];
+          const statusMap = (s?: string) => {
+            const v = (s || "").toLowerCase();
+            if (v.includes("iptal") || v.includes("cancel")) return "Cancelled" as const;
+            if (v.includes("gecik") || v.includes("delay")) return "Delayed" as const;
+            if (v.includes("indi") || v.includes("land")) return "Landed" as const;
+            if (v.includes("erken") || v.includes("early")) return "Early" as any;
+            return "On Time" as const;
+          };
+          for (const f of flights) {
+            results.push({
+              id: `${String(f?.flightNumber)}-${d.direction === "Arrival" ? "ARR" : "DEP"}-${String(f?.scheduledDatetime)}`,
+              airportCode: "IST",
+              flightNumber: String(f?.flightNumber || ""),
+              airline: String(f?.airlineName || f?.airlineCode || ""),
+              direction: d.direction,
+              originCity: String(f?.fromCityName || f?.fromCityCode || ""),
+              destinationCity: String(f?.toCityName || f?.toCityCode || ""),
+              scheduledTimeLocal: String(f?.scheduledDatetime || ""),
+              estimatedTimeLocal: f?.estimatedDatetime ? String(f?.estimatedDatetime) : undefined,
+              status: statusMap(f?.remark || f?.remarkCode),
+              gate: d.direction === "Departure" ? (f?.gate ? String(f.gate) : undefined) : undefined,
+              baggage: d.direction === "Arrival" ? (f?.carousel ? String(f.carousel) : undefined) : undefined,
+            } as Flight);
+          }
+        } catch {
+          // ignore this combination
+        }
+      }
     }
-    for (const r of depDisk.data?.rows ?? []) {
-      fromDisk.push({
-        id: `${r.flightNumber}-dep-${r.scheduled}`,
-        airportCode: "IST",
-        flightNumber: String(r.flightNumber || ""),
-        airline: String(r.airline || ""),
-        direction: "Departure",
-        originCity: "Istanbul",
-        destinationCity: String(r.destinationAirport || ""),
-        scheduledTimeLocal: r.scheduled,
-        estimatedTimeLocal: r.estimated,
-        status: String(r.status || "On Time") as any,
-        source: "cache:api:departures",
-        fetchedAt: new Date().toISOString() as any,
-        createdAt: new Date().toISOString() as any,
-        updatedAt: new Date().toISOString() as any,
-      } as Flight);
-    }
-    if (fromDisk.length) return fromDisk;
-
-    // Try Aviationstack (today)
-    let flights = await fetchIstFlightsFromAviationstack(date);
-    if (!flights.length) {
-      // Try Aviationstack without date (provider live/status queries inside adapter)
-      flights = await fetchIstFlightsFromAviationstack();
-    }
-    if (!flights.length) {
-      // Fallback to AeroDataBox time-window
-      flights = await fetchIstFlightsFromAeroDataBox();
-    }
-    return flights;
+    // Deduplicate by flightNumber + scheduled
+    const seen = new Set<string>();
+    return results.filter((f) => {
+      const k = `${f.flightNumber}-${f.scheduledTimeLocal}-${f.direction}`;
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
   }
 
   let allFlights: Flight[] = await loadLiveFlights();
@@ -122,11 +131,36 @@ export async function POST(req: NextRequest) {
     allFlights = (await fetchFlightsFromDb()).length ? await fetchFlightsFromDb() : staticFlights;
   }
 
-  const result = filterFlights(allFlights, {
-    type: merged.type,
-    city: merged.city,
-    flightNumber: merged.flightNumber,
-  });
+  // Fuzzy filter: score on flightNumber, city (origin/dest), airline
+  const qFlight = (merged.flightNumber || "").toUpperCase();
+  const qCity = merged.city ? strip(merged.city) : "";
+  const wantDir = merged.type;
+  function score(f: Flight): number {
+    let s = 0;
+    if (wantDir && f.direction === wantDir) s += 3;
+    if (qFlight) {
+      const fn = f.flightNumber.toUpperCase();
+      if (fn === qFlight || fn.replace(/\s+/g, "") === qFlight.replace(/\s+/g, "")) s += 6;
+      else if (fn.includes(qFlight)) s += 3;
+    }
+    if (qCity) {
+      const oc = strip(f.originCity);
+      const dc = strip(f.destinationCity);
+      if (oc === qCity || dc === qCity) s += 4;
+      else if (oc.includes(qCity) || dc.includes(qCity)) s += 2;
+    }
+    // slight boost for near-time flights (within +/- 6h)
+    try {
+      const t = new Date(f.scheduledTimeLocal).getTime();
+      const now = Date.now();
+      const diffH = Math.abs(t - now) / 3600000;
+      s += diffH < 2 ? 2 : diffH < 6 ? 1 : 0;
+    } catch {}
+    return s;
+  }
+  const scored = allFlights.map(f => ({ f, s: score(f) }));
+  const top = scored.filter(x => x.s > 0).sort((a,b) => b.s - a.s).slice(0, 10).map(x => x.f);
+  const result = top.length ? top : filterFlights(allFlights, { type: wantDir, city: merged.city, flightNumber: merged.flightNumber });
 
   if (result.length === 0) {
     return Response.json({
@@ -137,13 +171,19 @@ export async function POST(req: NextRequest) {
     });
   }
 
+  const fmtTime = (s?: string) => {
+    if (!s) return "";
+    try { const d = new Date(s); return d.toLocaleTimeString(lang === "tr" ? "tr-TR" : "en-US", { hour: "2-digit", minute: "2-digit" }); } catch { return s; }
+  };
   const lines = result.slice(0, 5).map((f) => {
     const cityText = f.direction === "Arrival" ? f.originCity : f.destinationCity;
-    return `${cityText}: ${f.flightNumber} ${f.status}`;
+    const gateOrBaggage = f.direction === "Departure" ? (f.gate ? `Gate ${f.gate}` : "") : (f.baggage ? `${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}` : "");
+    const timePair = `${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal ? ` / ${fmtTime(f.estimatedTimeLocal)}` : ""}`;
+    return `${f.flightNumber} ${cityText} ${timePair}${gateOrBaggage ? `, ${gateOrBaggage}` : ""} — ${f.status}`;
   });
   const answer = lang === "tr"
-    ? `Bulunan uçuşlar:\n${lines.join("\n")}`
-    : `Matching flights:\n${lines.join("\n")}`;
+    ? (result.length > 1 ? `Birden fazla eşleşme var:\n${lines.join("\n")}\nHangi uçuşu istiyorsunuz?` : `Uçuş: ${lines[0]}`)
+    : (result.length > 1 ? `There are multiple matches:\n${lines.join("\n")}\nWhich flight do you mean?` : `Flight: ${lines[0]}`);
 
   return Response.json({ answer, matches: result, gemini: geminiMeta ?? undefined, nluProvider });
 }

@@ -13,6 +13,8 @@ export interface Flight {
 	scheduledTimeLocal: string; // ISO time string in local airport timezone
 	estimatedTimeLocal?: string; // ISO time string in local airport timezone
 	status: FlightStatus;
+	gate?: string; // for departures (Kapı)
+	baggage?: string; // for arrivals (Bagaj/Carousel)
 }
 
 export interface FlightQuery {

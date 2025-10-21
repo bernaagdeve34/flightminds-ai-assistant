@@ -14,70 +14,78 @@ export default function Home() {
   const [allFlights, setAllFlights] = React.useState<Flight[]>([]);
   const [showIntro, setShowIntro] = React.useState(true);
   const [leftTab, setLeftTab] = React.useState<"departures" | "arrivals">("departures");
+  const [scope, setScope] = React.useState<"domestic" | "international">("domestic");
   const t = i18n[lang];
 
   React.useEffect(() => {
     async function load() {
       try {
-        const now = new Date();
-        const yyyy = now.getFullYear();
-        const mm = String(now.getMonth() + 1).padStart(2, "0");
-        const dd = String(now.getDate()).padStart(2, "0");
-        const date = `${yyyy}-${mm}-${dd}`;
-        const base = leftTab === "departures" ? "/api/aviationstack/departures" : "/api/aviationstack/arrivals";
-        const resp = await fetch(`${base}?date=${date}`, { cache: "no-store" });
-        const json = await resp.json();
-        const rows: any[] = leftTab === "departures" ? (json.departures ?? []) : (json.arrivals ?? []);
-        let useRows = rows;
-        if (!Array.isArray(useRows) || useRows.length === 0) {
-          // Retry without date to trigger provider's live/status fallback
-          const retry = await fetch(base, { cache: "no-store" }).then(r => r.json()).catch(() => ({ }));
-          useRows = leftTab === "departures" ? (retry.departures ?? []) : (retry.arrivals ?? []);
-        }
-        const mapped: Flight[] = (useRows as any[]).map((r) => {
-          if (leftTab === "departures") {
-            return {
-              id: `${r.flightNumber}-DEP-${r.scheduled}`,
-              airportCode: "IST",
-              flightNumber: String(r.flightNumber),
-              airline: String(r.airline || ""),
-              direction: "Departure",
-              originCity: "Istanbul",
-              destinationCity: String(r.destinationAirport || ""),
-              scheduledTimeLocal: r.scheduled,
-              estimatedTimeLocal: r.estimated,
-              status: String(r.status || "On Time"),
-            } as Flight;
-          }
-          return {
-            id: `${r.flightNumber}-ARR-${r.scheduled}`,
-            airportCode: "IST",
-            flightNumber: String(r.flightNumber),
-            airline: String(r.airline || ""),
-            direction: "Arrival",
-            originCity: String(r.departureAirport || ""),
-            destinationCity: "Istanbul",
-            scheduledTimeLocal: r.scheduled,
-            estimatedTimeLocal: r.estimated,
-            status: String(r.status || "On Time"),
-          } as Flight;
+        // 1) Tek istek: İç veya Dış hat, clickedButton ile yönü belirt
+        const clickedButton = ""; // İGA: boş bırakıyoruz
+        const nature = leftTab === "departures" ? "1" : "0"; // Kullanıcı kuralı: kalkış=1, varış=0
+
+        const isInternational = scope === "international" ? "1" : "0";
+        const body = new URLSearchParams({
+          nature,
+          searchTerm: "",
+          pageSize: "100",
+          isInternational,
+          date: "",
+          endDate: "",
+          culture: lang === "tr" ? "tr" : "en",
+          clickedButton,
+        }).toString();
+
+        const resp = await fetch(`/api/istairport/status`, {
+          method: "POST",
+          cache: "no-store",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body,
         });
-        setAllFlights(mapped);
+        const json = await resp.json().catch(() => ({} as any));
+        const flights: any[] = (json?.data ?? json)?.result?.data?.flights || [];
+
+        // 2) Map to our Flight type. Yönü sol sekmeden al (daha net)
+        const direction = leftTab === "departures" ? "Departure" : "Arrival";
+        const statusMap = (s?: string) => {
+          const v = (s || "").toLowerCase();
+          if (v.includes("iptal")) return "Cancelled";
+          if (v.includes("gecik")) return "Delayed";
+          if (v.includes("indi") || v.includes("land")) return "Landed" as any;
+          if (v.includes("erken")) return "Early" as any;
+          return "On Time";
+        };
+        const mappedAll: Flight[] = flights.map((f) => ({
+          id: `${String(f?.flightNumber)}-${direction === "Arrival" ? "ARR" : "DEP"}-${String(f?.scheduledDatetime)}`,
+          airportCode: "IST",
+          flightNumber: String(f?.flightNumber || ""),
+          airline: String(f?.airlineName || f?.airlineCode || ""),
+          direction,
+          originCity: String(f?.fromCityName || f?.fromCityCode || ""),
+          destinationCity: String(f?.toCityName || f?.toCityCode || ""),
+          scheduledTimeLocal: String(f?.scheduledDatetime || ""),
+          estimatedTimeLocal: f?.estimatedDatetime ? String(f?.estimatedDatetime) : undefined,
+          status: statusMap(f?.remark || f?.remarkCode),
+          gate: direction === "Departure" ? (f?.gate ? String(f.gate) : undefined) : undefined,
+          baggage: direction === "Arrival" ? (f?.carousel ? String(f.carousel) : undefined) : undefined,
+        } as Flight));
+
+        setAllFlights(mappedAll);
       } catch (e) {
         console.error("Home table fetch error:", e);
         setAllFlights([]);
       }
     }
     load();
-  }, [leftTab]);
+  }, [leftTab, scope, lang]);
 
   const departures = allFlights.filter((f) => f.direction === "Departure").sort(byTime);
   const arrivals = allFlights.filter((f) => f.direction === "Arrival").sort(byTime);
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-fuchsia-50">
-      {showIntro && <SplashIntro language={lang} onDone={() => setShowIntro(false)} />}
+      {showIntro && <SplashIntro language={lang} durationMs={3000} onDone={() => setShowIntro(false)} />}
       <header
-        className="flex items-center justify-between px-6 py-3 text-white"
+        className="sticky top-0 z-40 flex items-center justify-between px-6 py-3 text-white shadow-md"
         style={{ background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" }}
       >
         <div className="flex items-center gap-3">
@@ -102,6 +110,22 @@ export default function Home() {
               onClick={() => setLeftTab("arrivals")}
             >
               {t.arrivals}
+            </button>
+          </div>
+          <div className="mb-3 inline-flex rounded-full overflow-hidden border border-white/60 bg-white/90">
+            <button
+              className={`px-4 py-1.5 text-sm ${scope === "domestic" ? "text-white" : "text-gray-800"}`}
+              style={scope === "domestic" ? { background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" } : {}}
+              onClick={() => setScope("domestic")}
+            >
+              {lang === "tr" ? "İç Hatlar" : "Domestic"}
+            </button>
+            <button
+              className={`px-4 py-1.5 text-sm border-l ${scope === "international" ? "text-white" : "text-gray-800"}`}
+              style={scope === "international" ? { background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" } : {}}
+              onClick={() => setScope("international")}
+            >
+              {lang === "tr" ? "Dış Hatlar" : "International"}
             </button>
           </div>
           {leftTab === "departures" ? (
