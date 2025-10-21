@@ -17,7 +17,10 @@ export async function GET(req: NextRequest) {
         // Some endpoints check UA; use a generic browser UA
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+        "Origin": "https://www.istairport.com",
         "Referer": "https://www.istairport.com/",
+        "X-Requested-With": "XMLHttpRequest",
       },
       // avoid Next fetch cache for dynamic
       cache: "no-store",
@@ -48,8 +51,12 @@ export async function POST(req: NextRequest) {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "Accept": "application/json, text/plain, */*",
-        "Content-Type": req.headers.get("content-type") || "application/json",
+        // Force proper form encoding with charset (some servers require exact match)
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
+        "Origin": "https://www.istairport.com",
         "Referer": "https://www.istairport.com/",
+        "X-Requested-With": "XMLHttpRequest",
       },
       body: body || undefined,
       cache: "no-store",
