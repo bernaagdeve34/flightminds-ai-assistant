@@ -3,7 +3,7 @@ import { NextRequest } from "next/server";
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
-const ORIGIN = "https://www.istairport.com/umbraco/api/FlightInfo/GetFlightStatusBoard";
+const ORIGIN = process.env.IST_PROXY_URL?.trim() || "https://www.istairport.com/umbraco/api/FlightInfo/GetFlightStatusBoard";
 
 export async function GET(req: NextRequest) {
   try {

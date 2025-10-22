@@ -13,6 +13,12 @@ export async function POST(req: NextRequest) {
   const query: string = body?.query ?? "";
   const lang: "tr" | "en" = body?.lang === "en" ? "en" : "tr";
   const wantDebug: boolean = !!body?.debug;
+  // Resolve absolute base URL for internal API calls (Vercel requires absolute URLs on server)
+  const thisOrigin = (process.env.NEXT_PUBLIC_BASE_URL && process.env.NEXT_PUBLIC_BASE_URL.trim())
+    ? process.env.NEXT_PUBLIC_BASE_URL.trim().replace(/\/$/, "")
+    : (process.env.VERCEL_URL
+        ? `https://${process.env.VERCEL_URL.replace(/\/$/, "")}`
+        : new URL(req.url).origin);
 
   // 1) Try NLU providers: Gemini -> Groq -> Rules
   let nluProvider: "gemini" | "groq" | "rules" | undefined;
@@ -78,7 +84,7 @@ export async function POST(req: NextRequest) {
           clickedButton: "",
         }).toString();
         try {
-          const resp = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/istairport/status`, {
+          const resp = await fetch(`${thisOrigin}/api/istairport/status`, {
             method: "POST",
             headers: { "Content-Type": "application/x-www-form-urlencoded" },
             cache: "no-store",
