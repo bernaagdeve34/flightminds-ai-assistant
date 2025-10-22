@@ -12,6 +12,8 @@ const cors = require('cors');
 const app = express();
 app.use(cors());
 app.use(express.json());
+// Accept raw x-www-form-urlencoded bodies for proxying without mutation
+app.use(express.text({ type: 'application/x-www-form-urlencoded' }));
 
 function toISO(y, m, d, hh, mm) {
   return new Date(y, m - 1, d, hh, mm, 0, 0).toISOString();
@@ -89,6 +91,49 @@ app.get('/arrivals', (req, res) => {
   const date = parseDateParam(req.query.date);
   const flights = buildMockFlights(date).filter(f => f.dir === 'Arrival').map(mapOut);
   res.json({ date, flights });
+});
+
+// Live proxy to ISTAirport Flight Status (GET/POST)
+// Forward incoming request to origin with appropriate headers and return JSON/text transparently
+app.all('/istairport/status', async (req, res) => {
+  try {
+    const ORIGIN = (process.env.IST_PROXY_ORIGIN || 'https://www.istairport.com/umbraco/api/FlightInfo/GetFlightStatusBoard').trim();
+    const url = new URL(ORIGIN);
+    // copy query params
+    for (const [k, v] of Object.entries(req.query || {})) {
+      if (typeof v === 'string') url.searchParams.set(k, v);
+    }
+
+    // Prepare body: keep raw form body if present
+    const body = req.method === 'POST'
+      ? (typeof req.body === 'string' ? req.body : (req.body ? new URLSearchParams(req.body).toString() : undefined))
+      : undefined;
+
+    const resp = await fetch(url.toString(), {
+      method: req.method,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+        'Accept-Language': 'tr-TR,tr;q=0.9,en;q=0.8',
+        'Origin': 'https://www.istairport.com',
+        'Referer': 'https://www.istairport.com/',
+        'X-Requested-With': 'XMLHttpRequest',
+        ...(req.method === 'POST' ? { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' } : {}),
+      },
+      body,
+    });
+
+    const text = await resp.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+
+    if (!resp.ok) {
+      return res.status(200).json({ ok: false, status: resp.status, body: json ?? text });
+    }
+    return res.status(200).json({ ok: true, data: json ?? text });
+  } catch (e) {
+    return res.status(200).json({ ok: false, error: String(e && e.message ? e.message : e) });
+  }
 });
 
 const port = process.env.PORT || 4000;
