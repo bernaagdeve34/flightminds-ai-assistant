@@ -1,6 +1,7 @@
 "use client";
 
 import React from "react";
+import * as sdk from "microsoft-cognitiveservices-speech-sdk";
 import { i18n } from "@/lib/i18n";
 
 interface Props {
@@ -19,6 +20,32 @@ export default function AssistantPanel({ language }: Props) {
   const mediaRecRef = React.useRef<MediaRecorder | null>(null);
   const silenceTimerRef = React.useRef<any>(null);
 
+  // TTS helpers (önce tanımla ki aşağıda kullanılabilsin)
+  const stopSpeak = React.useCallback(() => {
+    const synth = synthRef.current ?? (typeof window !== "undefined" ? window.speechSynthesis : null);
+    if (synth && synth.speaking) {
+      synth.cancel();
+      setSpeaking(false);
+    }
+  }, []);
+
+  const speak = React.useCallback((text: string) => {
+    const synth = synthRef.current ?? (typeof window !== "undefined" ? window.speechSynthesis : null);
+    if (!synth) return;
+    try {
+      const utter = new SpeechSynthesisUtterance(text);
+      utter.lang = language === "tr" ? "tr-TR" : "en-US";
+      utter.rate = 1;
+      utter.onend = () => setSpeaking(false);
+      utter.onerror = () => setSpeaking(false);
+      synth.cancel();
+      setSpeaking(true);
+      synth.speak(utter);
+    } catch {
+      setSpeaking(false);
+    }
+  }, [language]);
+
   const sendQuery = React.useCallback(async (text: string) => {
     try {
       const resp = await fetch("/api/assistant", {
@@ -27,11 +54,16 @@ export default function AssistantPanel({ language }: Props) {
         body: JSON.stringify({ query: text, lang: language }),
       });
       const data = await resp.json();
-      setAnswer(data.answer ?? "");
+      const ans = String(data?.answer ?? "");
+      setAnswer(ans);
+      if (ans && speakEnabled) {
+        try { stopSpeak(); } catch {}
+        speak(ans);
+      }
     } catch {
       setAnswer("");
     }
-  }, [language]);
+  }, [language, speakEnabled, speak, stopSpeak]);
 
   // Whisper tabanlı kayıt (tercih edilen)
   const startWhisperRecording = React.useCallback(async () => {
@@ -85,6 +117,40 @@ export default function AssistantPanel({ language }: Props) {
     }
   }, [language, sendQuery]);
 
+  // Azure Speech (tek seferlik) — öncelikli yol
+  const startAzureRecognition = React.useCallback(async () => {
+    try {
+      setListening(true);
+      // Token al
+      const r = await fetch("/api/azure/speech/token", { method: "POST" });
+      const j = await r.json();
+      if (!j?.ok || !j?.token || !j?.region) throw new Error("Azure token alınamadı");
+
+      const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(j.token, j.region);
+      speechConfig.speechRecognitionLanguage = language === "tr" ? "tr-TR" : "en-US";
+      const audioConfig = sdk.AudioConfig.fromDefaultMicrophoneInput();
+      const recognizer = new sdk.SpeechRecognizer(speechConfig, audioConfig);
+
+      await new Promise<void>((resolve) => {
+        recognizer.recognizeOnceAsync(async (result: sdk.SpeechRecognitionResult) => {
+          try {
+            const text = String(result?.text || "").trim();
+            setTranscript(text);
+            if (text) await sendQuery(text);
+          } finally {
+            recognizer.close();
+            resolve();
+          }
+        });
+      });
+    } catch {
+      // Azure başarısızsa düşmeyelim; sadece dur ve kullanıcıyı bilgilendir.
+      alert("Azure STT başarısız oldu. Lütfen daha sonra tekrar deneyin.");
+    } finally {
+      setListening(false);
+    }
+  }, [language, sendQuery, startWhisperRecording]);
+
   // Web Speech fallback
   const startWebSpeech = React.useCallback(() => {
     const SpeechRecognition = (window as any).webkitSpeechRecognition || (window as any).SpeechRecognition;
@@ -130,30 +196,6 @@ export default function AssistantPanel({ language }: Props) {
     recognition.start();
   }, [language]);
 
-  const stopSpeak = React.useCallback(() => {
-    const synth = synthRef.current ?? (typeof window !== "undefined" ? window.speechSynthesis : null);
-    if (synth && synth.speaking) {
-      synth.cancel();
-      setSpeaking(false);
-    }
-  }, []);
-
-  const speak = React.useCallback((text: string) => {
-    const synth = synthRef.current ?? (typeof window !== "undefined" ? window.speechSynthesis : null);
-    if (!synth) return;
-    try {
-      const utter = new SpeechSynthesisUtterance(text);
-      utter.lang = language === "tr" ? "tr-TR" : "en-US";
-      utter.rate = 1;
-      utter.onend = () => setSpeaking(false);
-      utter.onerror = () => setSpeaking(false);
-      synth.cancel();
-      setSpeaking(true);
-      synth.speak(utter);
-    } catch {
-      setSpeaking(false);
-    }
-  }, [language]);
 
   React.useEffect(() => {
     synthRef.current = typeof window !== "undefined" ? window.speechSynthesis : null;
@@ -171,7 +213,7 @@ export default function AssistantPanel({ language }: Props) {
         <div className="opacity-90 mt-0.5 text-sm">{t.heroSubtitle}</div>
       </div>
       <button
-        onClick={startWhisperRecording}
+        onClick={startAzureRecognition}
         className={`h-16 w-16 rounded-full flex items-center justify-center shadow-lg transition-transform border ${
           listening ? "scale-105" : "bg-white"
         }`}

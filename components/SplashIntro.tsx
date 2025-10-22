@@ -28,6 +28,10 @@ export default function SplashIntro({ language, durationMs = 6000, onDone }: Pro
 		<div className="fixed inset-0 z-50 flex items-center justify-center text-white" style={{
             background: "linear-gradient(135deg, var(--ist-teal) 0%, var(--ist-cyan) 100%)"
         }}>
+			{/* IST logo top-left */}
+			<div className="absolute top-4 left-4">
+				<img src="/ist_logo.png" alt="IST" className="h-10 w-10 object-contain drop-shadow" />
+			</div>
 			{/* Plane animation layer */}
 			<div className="absolute top-24 left-0 right-0 pointer-events-none">
 				<div className="mx-auto w-full max-w-4xl relative h-10">
@@ -38,16 +42,8 @@ export default function SplashIntro({ language, durationMs = 6000, onDone }: Pro
 			</div>
 			<div className="flex flex-col items-center gap-6">
 				<div className="flex flex-col items-center gap-3">
-					<div className="h-28 w-28 relative drop-shadow-lg">
-						<img src="/ist_logo.png" alt="IST" className="h-28 w-28 object-contain" />
-					</div>
 					{/* Guidance icons row */}
 					<div className="mt-1 flex items-center gap-4">
-						<img
-							src="/yonlendirme1.jpg"
-							alt="guidance-1"
-							className="h-12 w-12 rounded-md object-cover drop-shadow-lg opacity-95 guidance-float"
-						/>
 						<img
 							src="/yonlendirme2.jpg"
 							alt="guidance-2"
@@ -61,7 +57,7 @@ export default function SplashIntro({ language, durationMs = 6000, onDone }: Pro
 						<span className="w-2 h-2 rounded-full bg-white/70 animate-bounce"></span>
 					</div>
 					<div className="text-center">
-						<div className="text-2xl font-semibold mb-1">{t.splash.redirectTitle}</div>
+						<div className="text-lg font-semibold mb-1">{t.splash.redirectTitle}</div>
 						<div className="text-sm opacity-90">{t.splash.redirectSubtitle}</div>
 					</div>
 					<div className="w-64 h-1.5 bg-white/30 rounded-full overflow-hidden">
