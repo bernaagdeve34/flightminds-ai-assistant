@@ -100,7 +100,7 @@ export default function Home() {
   return (
     <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-fuchsia-50">
       {showIntro && <SplashIntro language={lang} durationMs={3000} onDone={() => setShowIntro(false)} />}
-      <header className="sticky top-0 z-40 flex items-center justify-between px-6 py-3 bg-white text-gray-900 border-b shadow-sm">
+      <header className="sticky top-0 z-40 flex items-center justify-between px-4 sm:px-6 lg:px-8 py-3 bg-white text-gray-900 border-b shadow-sm">
         <div className="flex items-center gap-3">
           <img src="/ist_logtwo.png" alt="IST" className="h-8 w-8 object-contain" />
           <h1 className="text-lg font-semibold">{t.pageTitle}</h1>
@@ -122,7 +122,7 @@ export default function Home() {
           </button>
         </div>
       </header>
-      <main className="px-6 py-8 max-w-[1280px] mx-auto grid grid-cols-1 lg:grid-cols-12 gap-6">
+      <main className="container mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 xl:gap-8 max-w-screen-2xl">
         <div className="lg:col-span-12 flex items-center justify-center">
           <div className="mb-4 inline-flex rounded-full overflow-hidden border border-white/60 bg-white/90">
             <button
@@ -145,7 +145,7 @@ export default function Home() {
           <RichFlightTable title={t.departures} flights={departures} language={lang} />
         </div>
         <div className="lg:col-span-4 lg:self-start">
-          <AssistantPanel language={lang} />
+          <AssistantPanel language={lang} scope={scope} />
         </div>
         <div className="lg:col-span-4 lg:self-start">
           <RichFlightTable title={t.arrivals} flights={arrivals} language={lang} />

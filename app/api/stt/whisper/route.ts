@@ -10,9 +10,9 @@ export async function POST(req: NextRequest) {
     if (!audioBase64) {
       return new Response(JSON.stringify({ error: "audioBase64 required" }), { status: 400 });
     }
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.OPENAI_API_KEY?.trim();
     if (!apiKey) {
-      return new Response(JSON.stringify({ error: "OPENAI_API_KEY missing" }), { status: 500 });
+      return new Response(JSON.stringify({ ok: false, error: "OPENAI_API_KEY missing" }), { status: 500 });
     }
 
     const binary = Buffer.from(audioBase64, "base64");
@@ -26,23 +26,37 @@ export async function POST(req: NextRequest) {
     // Optional language hint
     form.append("language", lang === "tr" ? "tr" : "en");
 
-    const resp = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: form as any,
-    });
+    async function transcribe(model: string) {
+      const f = new FormData();
+      f.append("file", blob, "audio.webm");
+      f.append("model", model);
+      f.append("language", lang === "tr" ? "tr" : "en");
+      const r = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${apiKey}` },
+        body: f as any,
+      });
+      return r;
+    }
 
+    // Try modern model first, then fallback to whisper-1
+    let resp = await transcribe("gpt-4o-mini-transcribe");
     if (!resp.ok) {
-      const txt = await resp.text();
-      return new Response(JSON.stringify({ error: "openai_error", details: txt }), { status: 502 });
+      const firstErr = await resp.text();
+      resp = await transcribe("whisper-1");
+      if (!resp.ok) {
+        const secondErr = await resp.text();
+        return new Response(
+          JSON.stringify({ ok: false, error: "openai_error", details: { first: firstErr, second: secondErr } }),
+          { status: 502 }
+        );
+      }
     }
     const data: any = await resp.json();
-    const transcript: string = data?.text ?? "";
+    const transcript: string = String(data?.text ?? "");
 
-    return Response.json({ transcript });
+    return Response.json({ ok: true, transcript });
   } catch (e: any) {
-    return new Response(JSON.stringify({ error: "stt_failed", details: String(e?.message || e) }), { status: 500 });
+    return new Response(JSON.stringify({ ok: false, error: "stt_failed", details: String(e?.message || e) }), { status: 500 });
   }
 }

@@ -6,9 +6,10 @@ import { i18n } from "@/lib/i18n";
 
 interface Props {
   language: "tr" | "en";
+  scope?: "domestic" | "international";
 }
 
-export default function AssistantPanel({ language }: Props) {
+export default function AssistantPanel({ language, scope }: Props) {
   const [listening, setListening] = React.useState(false);
   const [transcript, setTranscript] = React.useState("");
   const [answer, setAnswer] = React.useState<string>("");
@@ -51,9 +52,10 @@ export default function AssistantPanel({ language }: Props) {
       const resp = await fetch("/api/assistant", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query: text, lang: language }),
+        body: JSON.stringify({ query: text, lang: language, scope, debug: true }),
       });
       const data = await resp.json();
+      try { console.log("ASSISTANT RESPONSE", data); } catch {}
       const ans = String(data?.answer ?? "");
       setAnswer(ans);
       if (ans && speakEnabled) {
@@ -96,9 +98,14 @@ export default function AssistantPanel({ language }: Props) {
             body: JSON.stringify({ audioBase64: base64, mimeType: mime, lang: language })
           });
           const data = await stt.json();
-          const text = String(data?.transcript || '');
+          const text = typeof data?.transcript === 'string' ? data.transcript : '';
+          const ok = data?.ok !== false;
           setTranscript(text);
-          if (text) await sendQuery(text);
+          if (ok && text) {
+            await sendQuery(text);
+          } else {
+            startWebSpeech();
+          }
         } catch {
           // Fallback: Web Speech'e dön
           startWebSpeech();
@@ -124,7 +131,12 @@ export default function AssistantPanel({ language }: Props) {
       // Token al
       const r = await fetch("/api/azure/speech/token", { method: "POST" });
       const j = await r.json();
-      if (!j?.ok || !j?.token || !j?.region) throw new Error("Azure token alınamadı");
+      if (!j?.ok || !j?.token || !j?.region) {
+        // Azure yoksa Web Speech'e düş
+        setListening(false);
+        startWebSpeech();
+        return;
+      }
 
       const speechConfig = sdk.SpeechConfig.fromAuthorizationToken(j.token, j.region);
       speechConfig.speechRecognitionLanguage = language === "tr" ? "tr-TR" : "en-US";
@@ -144,10 +156,11 @@ export default function AssistantPanel({ language }: Props) {
         });
       });
     } catch {
-      // Azure başarısızsa düşmeyelim; sadece dur ve kullanıcıyı bilgilendir.
-      alert("Azure STT başarısız oldu. Lütfen daha sonra tekrar deneyin.");
-    } finally {
+      // Azure başarısızsa Web Speech'e düş
       setListening(false);
+      startWebSpeech();
+    } finally {
+      // listening state Web Speech içinde yönetilecek
     }
   }, [language, sendQuery, startWhisperRecording]);
 
@@ -213,26 +226,24 @@ export default function AssistantPanel({ language }: Props) {
         <div className="opacity-90 mt-0.5 text-sm">{t.heroSubtitle}</div>
       </div>
       <button
-        onClick={startAzureRecognition}
+        onClick={startWebSpeech}
         className={`h-16 w-16 rounded-full flex items-center justify-center shadow-lg transition-transform border ${
           listening ? "scale-105" : "bg-white"
         }`}
         title={listening ? t.listening : t.micStart}
         style={listening ? { background: "var(--ist-teal)" } : { borderColor: "rgba(0,0,0,0.05)" }}
       >
-        <svg
-          width="28"
-          height="28"
-          viewBox="0 0 24 24"
-          fill="none"
-          xmlns="http://www.w3.org/2000/svg"
-          className={listening ? "text-white" : ""}
-          style={listening ? undefined : { color: "var(--ist-teal)" }}
-        >
-          <path d="M12 14c1.654 0 3-1.346 3-3V6c0-1.654-1.346-3-3-3S9 4.346 9 6v5c0 1.654 1.346 3 3 3z" fill="currentColor"/>
-          <path d="M19 11a1 1 0 10-2 0 5 5 0 11-10 0 1 1 0 10-2 0 7 7 0 0012 0z" fill="currentColor"/>
-          <path d="M11 19.938V22h2v-2.062A7.01 7.01 0 0012 20c-.34 0-.674-.022-1-.062z" fill="currentColor"/>
-        </svg>
+        <img
+          src="/yonlendirme1.jpg"
+          alt={t.micStart}
+          width={48}
+          height={48}
+          style={{
+            borderRadius: '9999px',
+            objectFit: 'cover',
+            filter: listening ? 'brightness(0) invert(1)' : 'none'
+          }}
+        />
       </button>
       <div className="w-full max-w-md bg-white/15 backdrop-blur-md rounded-2xl p-2.5">
         <div className="flex gap-2">
