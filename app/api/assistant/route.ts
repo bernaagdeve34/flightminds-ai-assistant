@@ -55,6 +55,21 @@ export async function POST(req: NextRequest) {
         if (gx) {
           return Response.json({ answer: gx.trim(), matches: [], nluProvider: "gemini-direct" });
         }
+
+  // City normalization used for matching (removes diacritics, parentheses and punctuation)
+  function cityBase(s: string): string {
+    try {
+      return s
+        .toLocaleLowerCase(lang === "tr" ? "tr-TR" : "en-US")
+        .normalize("NFD").replace(/\p{Diacritic}/gu, "")
+        .replace(/\(.*?\)/g, " ") // remove things like (SVO)
+        .replace(/[^a-z0-9\s]/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    } catch {
+      return s?.toString()?.toLowerCase() ?? "";
+    }
+  }
       } else if (wantDebug) {
         const txt = await resp.text().catch(() => "");
         return Response.json({
@@ -81,11 +96,67 @@ export async function POST(req: NextRequest) {
   const OPENAI_ONLY = String(process.env.OPENAI_ONLY || "").toLowerCase() === "true";
   const OPENAI_API_KEY_DIRECT = process.env.OPENAI_API_KEY?.trim();
   const OPENAI_PROJECT_ID_DIRECT = process.env.OPENAI_PROJECT_ID?.trim();
-  if (OPENAI_ONLY && OPENAI_API_KEY_DIRECT && !flightLike) {
+  if (OPENAI_ONLY && OPENAI_API_KEY_DIRECT) {
     try {
+      // Gather flight candidates from live data to give OpenAI concrete facts
+      const stripLite = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").replace(/[^a-z0-9\s]/gi, " ").replace(/\s+/g, " ").trim();
+      const trBase = (w: string) => w
+        // common Turkish case/postposition endings
+        .replace(/^(?:istanbul\s+)?havalimani$/,'ist')
+        .replace(/'(?:de|da|den|dan|e|a|ye|ya)$/,'')
+        .replace(/(?:lerde|larda|lerden|lardan|lere|lara|de|da|den|dan|e|a|ye|ya)$/,'')
+        .replace(/^(.*?)(?:\s+ucus|\s+uçuş)$/,'$1')
+        .replace(/[^a-z0-9]+/g,'')
+      ;
+      const norm = stripLite(query);
+      const stop = new Set([
+        "ne","zaman","when","time","flight","ucus","uçuş","ucusu","uçuşu","ucuslar","uçuşlar",
+        "to","from","is","the","today","bugun","bugün","yarin","yarın","saat","kacta","kaçta",
+        "var","mi","mı","mu","mü","miyim","miyim?","midir","nedir","hangi","ne zaman"
+      ]);
+      const rawToks = norm.split(" ").filter(w => w.length >= 3 && !stop.has(w));
+      const toks = rawToks.map(trBase).filter(Boolean);
+      const wantArr = /(arrival|arrive|arriving|gelen|varis|varış)/.test(norm);
+      const wantDep = /(departure|depart|giden|kalkis|kalkış)/.test(norm);
+
+      let candidates: Flight[] = await loadLiveFlights(true);
+      if (!candidates.length) {
+        candidates = (await fetchFlightsFromDb()).length ? await fetchFlightsFromDb() : staticFlights;
+      }
+      // Build city vocabulary to pick a better cityHint
+      const cityVocab = new Set<string>();
+      for (const f of candidates) {
+        cityVocab.add(trBase(stripLite(f.originCity)));
+        cityVocab.add(trBase(stripLite(f.destinationCity)));
+      }
+      let cityHint = toks.reverse().find(t => cityVocab.has(t));
+      if (!cityHint) cityHint = toks.slice(-1)[0];
+      // Basic filtering
+      if (wantArr || wantDep) candidates = candidates.filter(f => f.direction === (wantArr ? "Arrival" : "Departure"));
+      if (cityHint || toks.length) {
+        candidates = candidates.filter(f => {
+          const oc = trBase(stripLite(f.originCity));
+          const dc = trBase(stripLite(f.destinationCity));
+          const cc = [oc, dc].join(" ");
+          const tokenHits = toks.filter(t => t && cc.includes(t)).length;
+          if (cityHint && (oc.includes(cityHint) || dc.includes(cityHint))) return true;
+          // relax: at least one meaningful token should match
+          return tokenHits >= 1;
+        });
+      }
+      // Sort by upcoming soonest
+      candidates = candidates.sort((a,b) => {
+        try { return new Date(a.scheduledTimeLocal).getTime() - new Date(b.scheduledTimeLocal).getTime(); } catch { return 0; }
+      }).slice(0, 50);
+
+      const fmtTime = (s?: string) => { try { return s ? new Date(s).toLocaleTimeString(lang === "tr" ? "tr-TR" : "en-US", {hour:"2-digit", minute:"2-digit"}) : ""; } catch { return s||""; } };
+      const facts = candidates.map((f,i)=>`[${i+1}] ${f.flightNumber} ${(f.direction === "Arrival" ? f.originCity : f.destinationCity)} ${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal?` / ${fmtTime(f.estimatedTimeLocal)}`:""}${f.direction === "Departure" ? (f.gate?`, Gate ${f.gate}`:"") : (f.baggage?`, ${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}`:"")} — ${f.status}`).join("\n");
+
       const system = lang === "tr"
-        ? "İstanbul Havalimanı için konuşan bir asistansın. Kullanıcının sorusuna kısa, net ve doğru bir yanıt ver. Uydurma bilgi verme."
-        : "You are an assistant for Istanbul Airport. Provide a short, accurate answer. Do not fabricate.";
+        ? "İstanbul Havalimanı için konuşan bir asistansın. UÇUŞ BİLGİLERİ listesini GERÇEK kaynak olarak kullan.\n- Bir eşleşme varsa: tek cümlede saat/kapı/durum ver.\n- Birden fazla eşleşme varsa: tümünü satır satır listele (kısa).\n- Eşleşme yoksa: kibarca belirt ve yakın seçenek önerme. Uydurma bilgi verme."
+        : "You are an assistant for Istanbul Airport. Use FLIGHT FACTS as ground truth. If exactly one match: one concise sentence with time/gate/status. If multiple: list ALL matches line by line (short). If none: say so politely; do not fabricate.";
+      const userMsg = facts ? `${query}\n\nFLIGHT FACTS:\n${facts}` : query;
+
       const resp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: {
@@ -95,22 +166,14 @@ export async function POST(req: NextRequest) {
         },
         body: JSON.stringify({
           model: "gpt-4o-mini",
-          messages: [ { role: "system", content: system }, { role: "user", content: query } ],
+          messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
           temperature: 0.2,
         }),
       });
       if (resp.ok) {
-        const j = await resp.json().catch(() => null);
+        const j = await resp.json().catch(()=>null);
         const content = j?.choices?.[0]?.message?.content?.trim();
-        if (content) return Response.json({ answer: content, matches: [], nluProvider: "openai-direct" });
-      } else if (wantDebug) {
-        const txt = await resp.text().catch(() => "");
-        return Response.json({
-          answer: lang === "tr" ? "OpenAI yanıtı alınamadı (debug)." : "OpenAI response failed (debug).",
-          matches: [],
-          nluProvider: "openai-direct",
-          debug: { openaiDirect: { status: resp.status, body: txt?.slice(0, 800) } }
-        });
+        if (content) return Response.json({ answer: content, matches: candidates, nluProvider: "openai" });
       }
     } catch {}
     // If direct OpenAI failed, continue to normal logic
@@ -152,12 +215,14 @@ export async function POST(req: NextRequest) {
   const flightNumMatch = normalized.match(/\b([a-z]{2})\s?(\d{2,4})\b/i);
   // Uçuş niyeti anahtar kelimeleri (Türkçe ve İngilizce)
   const hasFlightKeywords = /(\bu[cç]u[sş]\w*|\bsefer\w*|\bgate\b|\bkap[iı]\w*|\bkalk[iı]s\w*|\bvar[iı]s\w*|\bgiden\b|\bgelen\b|\bterminal\b|\bflt\b|\bflight\b)/.test(normalized);
-  // Şehir çıkarımını gelişi güzel yapmayalım; ancak uçuş niyeti varsa dene
-  const cityMatch = hasFlightKeywords ? normalized.match(/\b([a-z]{3,})\b/i) : null;
+  // Şehir çıkarımı: uçuş niyeti varsa, stopword olmayan son token'ı şehir adayı olarak al
+  const stopEarly = new Set(["ne","zaman","when","time","flight","ucus","uçuş","to","from","is","the","today","bugun","bugün","yarin","yarın"]);
+  const toksEarly = normalized.split(" ").filter(w => w.length >= 3 && !stopEarly.has(w));
+  const cityGuess = hasFlightKeywords ? toksEarly.at(-1) : undefined;
 
   const allowNluFlight = hasFlightKeywords || !!flightNumMatch;
   const merged = {
-    city: city ?? (hasFlightKeywords ? cityMatch?.[1] : undefined),
+    city: city ?? cityGuess,
     type: (isArrival ? "Arrival" : isDeparture ? "Departure" : undefined) ?? (allowNluFlight ? type : undefined),
     flightNumber: flightNumber ?? (flightNumMatch ? `${flightNumMatch[1].toUpperCase()} ${flightNumMatch[2]}` : undefined),
   };
@@ -372,12 +437,12 @@ export async function POST(req: NextRequest) {
   }
 
   // 0) Build flight list from ISTAirport live proxy (both directions, domestic & international)
-  async function loadLiveFlights(): Promise<Flight[]> {
+  async function loadLiveFlights(forceAllScopes: boolean = false): Promise<Flight[]> {
     const directions: Array<{ nature: string; direction: FlightDirection }> = [
       { nature: "1", direction: "Departure" },
       { nature: "0", direction: "Arrival" },
     ];
-    const scopes = scope ? [scope === "international" ? "1" : "0"] : ["0", "1"]; // 0: domestic, 1: international
+    const scopes = forceAllScopes ? ["0", "1"] : (scope ? [scope === "international" ? "1" : "0"] : ["0", "1"]); // 0: domestic, 1: international
 
     const results: Flight[] = [];
     for (const d of directions) {
