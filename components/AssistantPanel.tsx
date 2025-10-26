@@ -49,6 +49,8 @@ export default function AssistantPanel({ language, scope }: Props) {
 
   const sendQuery = React.useCallback(async (text: string) => {
     try {
+      // metinle gönderildiğinde alt tarafta soru olarak göster
+      setTranscript(text);
       const resp = await fetch("/api/assistant", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -261,20 +263,13 @@ export default function AssistantPanel({ language, scope }: Props) {
             {t.send}
           </button>
         </div>
-        <div className="flex items-center justify-between mt-1.5">
-					<button
-						onClick={() => setSpeakEnabled((v) => !v)}
-						className={`text-xs px-2.5 py-1 rounded-full border ${speakEnabled ? "bg-white/80 text-gray-900" : "bg-white/20 text-white"}`}
-						title={t.tts.speakToggle}
-					>
-						{t.tts.speakToggle}
-					</button>
-					{speaking && (
-						<button onClick={stopSpeak} className="text-xs px-2.5 py-1 rounded-full bg-rose-500 text-white">
-							{t.tts.stop}
-						</button>
-					)}
-				</div>
+        {speaking && (
+          <div className="flex justify-end mt-1.5">
+            <button onClick={stopSpeak} className="text-xs px-2.5 py-1 rounded-full bg-rose-500 text-white">
+              {t.tts.stop}
+            </button>
+          </div>
+        )}
 				{transcript && (
 					<div className="text-xs text-white/90 mt-1.5">{t.queryLabel} {transcript}</div>
 				)}
