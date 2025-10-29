@@ -1,4 +1,6 @@
 import { NextRequest } from "next/server";
+import fs from "node:fs";
+import path from "node:path";
 import { flights as staticFlights } from "@/lib/data/flights";
 import { filterFlights } from "@/lib/utils";
 import { fetchFlightsFromDb } from "@/lib/db/flights";
@@ -13,6 +15,120 @@ import { IST_ALLOWED_PAGES } from "@/lib/content/istPages";
 const ragCache = new Map<string, { at: number; answer: string }>();
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// FAQ cache (CSV: genelsorular.csv)
+type FaqItem = { q: string; a: string; q_en?: string; a_en?: string };
+let faqCache: Array<FaqItem> | null = null;
+const DEFAULT_FAQ_SHEET_URL = "https://docs.google.com/spreadsheets/d/1UxFlL8OcXz0l9i8VpuiPZOcq6YKlkPPEKe9paBg4oXc/export?format=csv&gid=0";
+function normalizeText(s: string, lang: "tr" | "en"): string {
+  return (s || "")
+    .toLocaleLowerCase(lang === "tr" ? "tr-TR" : "en-US")
+    .normalize("NFD").replace(/\p{Diacritic}/gu, "")
+    .replace(/[^a-z0-9\s]/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    // domain-specific canonical forms
+    .replace(/\bwi[\s-]?fi\b/g, "wifi")
+    .replace(/\bkio?sk\w*\b/g, "kiosk")
+    .replace(/\bfast\s*track\b/g, "fasttrack")
+    .replace(/\botopark\b/g, "parking")
+    .replace(/\bparking\b/g, "parking")
+    .replace(/\babonelik\w*\b/g, "subscription")
+    .replace(/\bsubscription\b/g, "subscription");
+}
+function parseCsvFlexible(csv: string): FaqItem[] {
+  // Robust CSV parser supporting commas and newlines inside quotes
+  const rows: string[][] = [];
+  let cur: string[] = [];
+  let field = "";
+  let inQuotes = false;
+  for (let i = 0; i < csv.length; i++) {
+    const ch = csv[i];
+    if (ch === '"') {
+      // Handle escaped quotes inside quoted field
+      if (inQuotes && csv[i+1] === '"') { field += '"'; i++; continue; }
+      inQuotes = !inQuotes;
+      continue;
+    }
+    if (!inQuotes && ch === ',') { cur.push(field); field = ""; continue; }
+    if (!inQuotes && (ch === '\n')) {
+      cur.push(field); field = "";
+      // Trim trailing \r if present
+      if (cur.length === 1 && cur[0].trim() === "") { cur = []; continue; }
+      rows.push(cur.map(s => s.replace(/^\s+|\s+$/g, ""))); cur = []; continue;
+    }
+    if (!inQuotes && ch === '\r') { continue; }
+    field += ch;
+  }
+  // push last field/row
+  cur.push(field);
+  if (cur.some(s => s.trim().length)) rows.push(cur.map(s => s.replace(/^\s+|\s+$/g, "")));
+  if (!rows.length) return [];
+  const hdr = rows[0].map(h => h.replace(/^"|"$/g, "").trim().toLowerCase());
+  const idxQ = hdr.findIndex(h => /^(sorular|soru|question|questions)$/.test(h));
+  const idxA = hdr.findIndex(h => /^(cevaplar|cevap|answer|answers)$/.test(h));
+  // Support both suffix _en and prefix en_
+  const idxQEn = hdr.findIndex(h => /^(sorular_en|soru_en|question_en|questions_en|en_sorular|en_soru|en_question|en_questions)$/.test(h));
+  const idxAEn = hdr.findIndex(h => /^(cevaplar_en|cevap_en|answer_en|answers_en|en_cevaplar|en_cevap|en_answer|en_answers)$/.test(h));
+  const out: FaqItem[] = [];
+  for (let r = 1; r < rows.length; r++) {
+    const cols = rows[r];
+    const get = (idx: number) => idx >= 0 ? (cols[idx] ?? "").replace(/^"|"$/g, "").trim() : "";
+    const q = idxQ >= 0 ? get(idxQ) : (cols[0] ?? "").trim();
+    const a = idxA >= 0 ? get(idxA) : (cols.slice(1).join(",") ?? "").trim();
+    const q_en = idxQEn >= 0 ? get(idxQEn) : undefined;
+    const a_en = idxAEn >= 0 ? get(idxAEn) : undefined;
+    if (q) out.push({ q, a, q_en, a_en });
+  }
+  return out;
+}
+
+async function loadFAQ(): Promise<Array<FaqItem>> {
+  if (faqCache) return faqCache;
+  try {
+    const filePath = path.join(process.cwd(), "genelsorular.csv");
+    const buf = fs.readFileSync(filePath, "utf8");
+    const out: FaqItem[] = parseCsvFlexible(buf);
+    faqCache = out;
+    // Also attempt to fetch from Google Sheets and merge
+    try {
+      const sheetUrlRaw = process.env.FAQ_SHEET_URL?.trim() || DEFAULT_FAQ_SHEET_URL;
+      const sheetUrl = sheetUrlRaw.includes("/export?") ? sheetUrlRaw : (sheetUrlRaw.includes("docs.google.com/spreadsheets")
+        ? sheetUrlRaw.replace(/\/edit.*$/, "/export?format=csv&gid=0")
+        : sheetUrlRaw);
+      const resp = await fetch(sheetUrl, { cache: "no-store" });
+      if (resp.ok) {
+        const csv = await resp.text();
+        const add = parseCsvFlexible(csv);
+        for (const it of add) {
+          if (!out.some(x => normalizeText(x.q, 'tr') === normalizeText(it.q, 'tr'))) {
+            out.push(it);
+          }
+        }
+        faqCache = out;
+      }
+    } catch {}
+    return faqCache ?? out;
+  } catch {
+    // Try remote sheet even if local file missing
+    try {
+      const sheetUrl = process.env.FAQ_SHEET_URL?.trim() || DEFAULT_FAQ_SHEET_URL;
+      const resp = await fetch(sheetUrl, { cache: "no-store" });
+      if (!resp.ok) return [];
+      const csv = await resp.text();
+      const out: FaqItem[] = parseCsvFlexible(csv);
+      faqCache = out;
+      return out;
+    } catch { return []; }
+  }
+}
+function similarity(a: string, b: string): number {
+  const ta = new Set(a.split(" ").filter(Boolean));
+  const tb = new Set(b.split(" ").filter(Boolean));
+  const inter = [...ta].filter(x => tb.has(x)).length;
+  const union = new Set([...ta, ...tb]).size || 1;
+  return inter / union;
+}
+
 export async function POST(req: NextRequest) {
   const body = await req.json().catch(() => null);
   const query: string = body?.query ?? "";
@@ -26,6 +142,197 @@ export async function POST(req: NextRequest) {
     : (process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL.replace(/\/$/, "")}`
         : new URL(req.url).origin);
+
+  // Early: try FAQ direct answer to avoid mixing with flight/RAG logic
+  try {
+    const faq = await loadFAQ();
+    if (faq.length) {
+      const nq = normalizeText(query, lang);
+      // If specific intents exist, restrict candidate FAQs accordingly
+      const needWifiKiosk = /\bwifi\b/.test(nq) && /\bkiosk\b/.test(nq);
+      const isLocationIntent = /(nerede|konum|noktalar|lokasyon|where|location|points)/i.test(query);
+      const needFastTrackLocation = /\bfasttrack\b/.test(nq) && isLocationIntent;
+      const needParkingSubscription = /\bparking\b/.test(nq) && /\bsubscription\b/.test(nq);
+      const cand = needWifiKiosk
+        ? faq.filter(x => { const qq = (lang === 'en' ? (x.q_en || x.q) : x.q); const qn = normalizeText(qq, lang); return /\bwifi\b/.test(qn) && /\bkiosk\b/.test(qn); })
+        : needFastTrackLocation
+          ? faq.filter(x => { const qq = (lang === 'en' ? (x.q_en || x.q) : x.q); const qn = normalizeText(qq, lang); return /\bfasttrack\b/.test(qn) && /(nerede|konum|noktalar|lokasyon|where|location|points)/.test(qq.toLowerCase()); })
+          : needParkingSubscription
+            ? faq.filter(x => { const qq = (lang === 'en' ? (x.q_en || x.q) : x.q); const qn = normalizeText(qq, lang); return /\bparking\b/.test(qn) && /\bsubscription\b/.test(qn); })
+            : faq;
+      // Deterministic FastTrack location answer to avoid wrong matches
+      if (needFastTrackLocation) {
+        const ftItem = faq.find(x => {
+          const qnTr = normalizeText(x.q, 'tr');
+          return /\bfasttrack\b/.test(qnTr) && /(nerede|noktalar|lokasyon)/.test(x.q.toLowerCase());
+        }) || cand[0];
+        if (ftItem) {
+          const ansRaw = (lang === 'en' ? (ftItem.a_en || '') : ftItem.a).trim();
+          if (ansRaw) {
+            return Response.json({ answer: ansRaw, matches: [], nluProvider: 'faq-csv', faq: { score: 1, q: (lang==='en' ? (ftItem.q_en || ftItem.q) : ftItem.q) } });
+          }
+          if (lang === 'en' && (ftItem.a || '').trim()) {
+            const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+            const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+            if (OPENAI_API_KEY_FAQ) {
+              try {
+                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                  method: 'POST',
+                  headers: { 'Authorization': `Bearer ${OPENAI_API_KEY_FAQ}`, 'Content-Type': 'application/json', ...(OPENAI_PROJECT_ID_FAQ ? { 'OpenAI-Project': OPENAI_PROJECT_ID_FAQ } : {}) },
+                  body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Translate the following Turkish answer into clear, concise English. Do not add extra information.' }, { role: 'user', content: ftItem.a } ], temperature: 0.1 })
+                });
+                if (resp.ok) {
+                  const j = await resp.json().catch(()=>null);
+                  const content = j?.choices?.[0]?.message?.content?.trim();
+                  if (content) return Response.json({ answer: content, matches: [], nluProvider: 'faq-translate', faq: { score: 1, q: (ftItem.q_en || ftItem.q) } });
+                }
+              } catch {}
+            }
+          }
+          return Response.json({ answer: lang === 'tr' ? 'Bu konuda kesin bir bilgi bulamadım. Lütfen farklı ifade ile tekrar sorar mısınız?' : "Couldn't find definitive info. Please rephrase your question.", matches: [], nluProvider: 'faq-empty' });
+        }
+      }
+      // 1) Exact/substring normalized match shortcut
+      const candsNorm = cand.map((x, i) => ({ i, item: x, qn: normalizeText(lang === 'en' ? (x.q_en || x.q) : x.q, lang) }));
+      const exact = candsNorm.find(c => c.qn === nq);
+      const contains = !exact ? candsNorm.find(c => (c.qn.length > 6 && (c.qn.includes(nq) || nq.includes(c.qn)))) : undefined;
+      const direct = exact || contains;
+      if (direct) {
+        const item = direct.item;
+        const ansRaw = (lang === 'en' ? (item.a_en || '') : item.a).trim();
+        if (ansRaw) {
+          return Response.json({ answer: ansRaw, matches: [], nluProvider: 'faq-csv', faq: { score: 1, q: (lang==='en' ? (item.q_en || item.q) : item.q) } });
+        }
+        if (lang === 'en' && (item.a || '').trim()) {
+          const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+          const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+          if (OPENAI_API_KEY_FAQ) {
+            try {
+              const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${OPENAI_API_KEY_FAQ}`, 'Content-Type': 'application/json', ...(OPENAI_PROJECT_ID_FAQ ? { 'OpenAI-Project': OPENAI_PROJECT_ID_FAQ } : {}) },
+                body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Translate the following Turkish answer into clear, concise English. Do not add extra information.' }, { role: 'user', content: item.a } ], temperature: 0.1 })
+              });
+              if (resp.ok) {
+                const j = await resp.json().catch(()=>null);
+                const content = j?.choices?.[0]?.message?.content?.trim();
+                if (content) return Response.json({ answer: content, matches: [], nluProvider: 'faq-translate', faq: { score: 1, q: (item.q_en || item.q) } });
+              }
+            } catch {}
+          }
+        }
+        return Response.json({ answer: lang === 'tr' ? 'Bu konuda kesin bir bilgi bulamadım. Lütfen farklı ifade ile tekrar sorar mısınız?' : "Couldn't find definitive info. Please rephrase your question.", matches: [], nluProvider: 'faq-empty' });
+      }
+
+      // 2) Similarity scoring fallback
+      let scored = cand.map((x, i) => {
+        const qtext = lang === 'en' ? (x.q_en || x.q) : x.q;
+        const base = similarity(nq, normalizeText(qtext, lang));
+        // small boost if location intent words appear in candidate question
+        const locBoost = isLocationIntent && /(nerede|konum|noktalar|lokasyon|where|location|points)/.test((qtext||"").toLowerCase()) ? 0.08 : 0;
+        const ftBoost = /\bfasttrack\b/.test(nq) && /\bfast\s*track\b|\bfasttrack\b/.test((qtext||"").toLowerCase()) ? 0.06 : 0;
+        return { i, s: base + locBoost + ftBoost };
+      }).sort((a,b)=> b.s - a.s);
+      let bestIdx = scored.length ? scored[0].i : -1;
+      let best = scored.length ? scored[0].s : 0;
+      // If English and low score, translate query to Turkish to match TR questions
+      if (lang === 'en' && (best < 0.20)) {
+        const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+        const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+        if (OPENAI_API_KEY_FAQ) {
+          try {
+            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
+                "Content-Type": "application/json",
+                ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
+              },
+              body: JSON.stringify({
+                model: "gpt-4o-mini",
+                messages: [
+                  { role: "system", content: "Translate the user's question into Turkish only. Return just the translation text." },
+                  { role: "user", content: query }
+                ],
+                temperature: 0.0,
+              }),
+            });
+            if (resp.ok) {
+              const j = await resp.json().catch(()=>null);
+              const trQ = j?.choices?.[0]?.message?.content?.trim();
+              if (trQ) {
+                const nqTr = normalizeText(trQ, 'tr');
+                scored = cand.map((x, i) => ({ i, s: similarity(nqTr, normalizeText(x.q, 'tr')) }))
+                  .sort((a,b)=> b.s - a.s);
+                bestIdx = scored.length ? scored[0].i : -1;
+                best = scored.length ? scored[0].s : 0;
+              }
+            }
+          } catch {}
+        }
+      }
+      if (bestIdx >= 0 && best >= 0.20) {
+        const base = needWifiKiosk ? cand : faq;
+        const item = base[bestIdx];
+        const ansRaw = (lang === 'en' ? (item.a_en || '') : item.a).trim();
+        if (ansRaw) {
+          return Response.json({ answer: ansRaw, matches: [], nluProvider: "faq-csv", faq: { score: best, q: (lang==='en' ? (item.q_en || item.q) : item.q) } });
+        }
+        // If English requested but only Turkish answer exists, translate it
+        if (lang === 'en' && (item.a || '').trim()) {
+          const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+          const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+          if (OPENAI_API_KEY_FAQ) {
+            try {
+              const system = "Translate the following Turkish answer into clear, concise English. Do not add extra information.";
+              const userMsg = item.a;
+              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
+                  "Content-Type": "application/json",
+                  ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
+                },
+                body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ], temperature: 0.1 }),
+              });
+              if (resp.ok) {
+                const j = await resp.json().catch(()=>null);
+                const content = j?.choices?.[0]?.message?.content?.trim();
+                if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-translate", faq: { score: best, q: (item.q_en || item.q) } });
+              }
+            } catch {}
+          }
+        }
+        // Answer is empty in CSV/Sheet: ask OpenAI to produce a concise answer
+        const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+        const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+        if (OPENAI_API_KEY_FAQ) {
+          try {
+            const system = lang === "tr"
+              ? "İstanbul Havalimanı genel danışma asistanısın. Kullanıcının sorusuna kısa, net ve doğru bir cevap ver. Uydurma bilgi verme. Bilgin yoksa kibarca belirt ve ilgili sayfayı öner."
+              : "You are an Istanbul Airport assistant. Provide a short, accurate answer. If unsure, say so politely and suggest the relevant page.";
+            const userMsg = query;
+            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+              method: "POST",
+              headers: {
+                "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
+                "Content-Type": "application/json",
+                ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
+              },
+              body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ], temperature: 0.2 }),
+            });
+            if (resp.ok) {
+              const j = await resp.json().catch(()=>null);
+              const content = j?.choices?.[0]?.message?.content?.trim();
+              if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-openai-empty", faq: { score: best, q: (lang==='en' ? (item.q_en || item.q) : item.q) } });
+            }
+          } catch {}
+        }
+        // last resort
+        return Response.json({ answer: lang === "tr" ? "Bu konuda kesin bir bilgi bulamadım. Lütfen farklı ifade ile tekrar sorar mısınız?" : "Couldn't find definitive info. Please rephrase your question.", matches: [], nluProvider: "faq-empty" });
+      }
+    }
+  } catch {}
 
   // 0-a) If forced, route ALL questions directly to Gemini and return
   const GEMINI_ONLY = String(process.env.GEMINI_ONLY || "").toLowerCase() === "true";
@@ -55,21 +362,6 @@ export async function POST(req: NextRequest) {
         if (gx) {
           return Response.json({ answer: gx.trim(), matches: [], nluProvider: "gemini-direct" });
         }
-
-  // City normalization used for matching (removes diacritics, parentheses and punctuation)
-  function cityBase(s: string): string {
-    try {
-      return s
-        .toLocaleLowerCase(lang === "tr" ? "tr-TR" : "en-US")
-        .normalize("NFD").replace(/\p{Diacritic}/gu, "")
-        .replace(/\(.*?\)/g, " ") // remove things like (SVO)
-        .replace(/[^a-z0-9\s]/gi, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    } catch {
-      return s?.toString()?.toLowerCase() ?? "";
-    }
-  }
       } else if (wantDebug) {
         const txt = await resp.text().catch(() => "");
         return Response.json({
@@ -260,7 +552,7 @@ export async function POST(req: NextRequest) {
   // If no clear flight intent, do lightweight RAG over IST pages
   // If query clearly refers to general topics, never treat as flight
   const generalGuard = /(bagaj|bavul|otopark|havaist|taksi|otob[uü]s|wifi|wi\-?fi|loung[e]?|harita|rehber|sss|sıkça|adres|konum|nerede|duty\s?free|ma[gğ]aza|yeme|i[cç]e|restoran)/i.test(query);
-  const looksLikeFlight = !GEMINI_ONLY && !generalGuard && !!(merged.type || merged.flightNumber || hasFlightKeywords || /\btk\s?\d{2,4}\b/i.test(normalized));
+  const looksLikeFlight = /\b[a-z]{2}\s?\d{2,4}\b/i.test(normalized) || hasFlightKeywords;
 
   // Location intent quick answer (avoid flight branch)
   const isLocationQ = /(nerede|adres|konum|nasil giderim|nasıl giderim|where is|address|location)/i.test(query);
@@ -277,6 +569,81 @@ export async function POST(req: NextRequest) {
     return Response.json({ answer, matches: [], nluProvider: nluProvider ?? "rules" });
   }
   if (!looksLikeFlight) {
+    // 0) Try fast FAQ CSV answer
+    try {
+      const faq = await loadFAQ();
+      if (faq.length) {
+        const nq = normalizeText(query, lang);
+        const scored = faq.map((x, i) => ({ i, s: similarity(nq, normalizeText(x.q, lang)) }))
+          .sort((a,b)=> b.s - a.s);
+        const bestIdx = scored.length ? scored[0].i : -1;
+        const best = scored.length ? scored[0].s : 0;
+        if (bestIdx >= 0 && best >= 0.20) {
+          const ans = faq[bestIdx].a || faq[bestIdx].q;
+          return Response.json({ answer: ans, matches: [], nluProvider: "faq-csv", faq: { score: best, q: faq[bestIdx].q } });
+        }
+        // Weak match policy:
+        // - For EN queries: do NOT compose an answer from facts. Pick the best FAQ and translate its TR answer deterministically.
+        // - For TR queries: allow FACTS-based phrasing as before.
+        if (lang === 'en' && scored.length) {
+          const bestIdx2 = scored[0].i;
+          const item = faq[bestIdx2];
+          const trAns = (item.a || '').trim();
+          if (trAns) {
+            const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+            const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+            if (OPENAI_API_KEY_FAQ) {
+              try {
+                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                  method: "POST",
+                  headers: { "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`, "Content-Type": "application/json", ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}) },
+                  body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: "Translate the following Turkish answer into clear, concise English. Do not add or remove information. Preserve line breaks." }, { role: "user", content: trAns } ], temperature: 0.0 })
+                });
+                if (resp.ok) {
+                  const j = await resp.json().catch(()=>null);
+                  const content = j?.choices?.[0]?.message?.content?.trim();
+                  if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-translate-weak", faq: { q: item.q } });
+                }
+              } catch {}
+            }
+            // If translation not possible, return TR answer as-is
+            return Response.json({ answer: trAns, matches: [], nluProvider: "faq-tr-fallback", faq: { q: item.q } });
+          }
+        } else {
+          const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+          const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+          if (OPENAI_API_KEY_FAQ && scored.length) {
+            const topFacts = scored.slice(0, 3).map(({i},k)=>`[${k+1}] Q: ${faq[i].q}\nA: ${faq[i].a}`).join("\n\n");
+            const system = lang === "tr"
+              ? "İstanbul Havalimanı genel danışma asistanısın. Aşağıdaki FAQ FACTS verilerini temel alarak kısa ve net bir cevap oluştur. Sadece verilen bilgilerden yararlan, uydurma bilgi verme."
+              : "You are an Istanbul Airport assistant. Using only the FAQ FACTS below, produce a short, accurate answer. Do not fabricate.";
+            const userMsg = `${query}\n\nFAQ FACTS:\n${topFacts}`;
+            try {
+              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
+                  "Content-Type": "application/json",
+                  ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
+                },
+                body: JSON.stringify({
+                  model: "gpt-4o-mini",
+                  messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
+                  temperature: 0.1,
+                }),
+              });
+              if (resp.ok) {
+                const j = await resp.json().catch(()=>null);
+                const content = j?.choices?.[0]?.message?.content?.trim();
+                if (content) {
+                  return Response.json({ answer: content, matches: [], nluProvider: "faq-openai" });
+                }
+              }
+            } catch {}
+          }
+        }
+      }
+    } catch {}
     // Cache check
     const cacheKey = `${lang}|${strip(query)}`;
     const cached = ragCache.get(cacheKey);
@@ -295,19 +662,25 @@ export async function POST(req: NextRequest) {
       type Hit = { score: number; snippet: string; url: string; title?: string };
       const hits: Hit[] = [];
       // Fetch a subset in parallel (cap to 8 for speed)
-      const pages = IST_ALLOWED_PAGES.slice(0, 20);
-      const resps = await Promise.allSettled(pages.map(p => fetch(p.url, { cache: "no-store" }).then(r => r.text()).then(t => ({ html: t, url: p.url, title: p.title }))));
+      const pages = IST_ALLOWED_PAGES.slice(0, 8);
+      const resps = await Promise.allSettled(
+        pages.map(p => fetch(p.url, { cache: "no-store" })
+          .then(r => r.text())
+          .then(t => ({ html: t, url: p.url, title: p.title }))
+        )
+      );
       for (const r of resps) {
         if (r.status !== "fulfilled") continue;
-        const { html, url, title } = r.value as any;
-        const text = htmlToText(html);
-        // Split to sentences/short paragraphs
-        const chunks = text.split(/(?<=[\.!\?])\s+/u).slice(0, 1200);
+        const { html, url, title } = r.value as { html: string; url: string; title?: string };
+        const text = html
+          .replace(/<script[\s\S]*?<\/script>/gi, " ")
+          .replace(/<style[\s\S]*?<\/style>/gi, " ")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
+        const norm = text.toLowerCase();
+        const chunks = text.split(/(?<=[.!?])\s+/u).slice(0, 600);
         for (const ch of chunks) {
-          const norm = strip(ch);
-          // skip very short or menu-like paragraphs
-          if (norm.length < 40) continue;
-          if (/(tr\s*en|english|zh|ru|ar|de|fr|es)\b/.test(norm)) continue;
           // term scoring: fuzzy Turkish endings
           let matchCount = 0; let score = 0;
           for (const t of terms) {

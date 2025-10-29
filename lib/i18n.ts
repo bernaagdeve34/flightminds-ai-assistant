@@ -14,9 +14,9 @@ export const i18n = {
     heroTitle: "Size nasıl yardımcı olabilirim?",
     heroSubtitle: "Mikrofona dokunun veya metinle başlayın",
     samplePrompts: [
-      "Cem Caman (ADA) varış uçuşu ne zaman?",
-      "W6J470 zamanında mı?",
-      "Bugün Ankara'ya uçuş ne zaman?",
+      "Antalya uçuşu ne zaman?",
+      "TK2424 zamanında mı?",
+      "Çukurova uçuşu saat kaçta?",
     ],
     tts: {
       speakToggle: "Sesli yanıt",
@@ -60,8 +60,8 @@ export const i18n = {
     heroTitle: "How can I help you?",
     heroSubtitle: "Tap the microphone or start typing",
     samplePrompts: [
-      "When does GDN (Gdansk) arrival land?",
-      "Is W6J470 on time?",
+      "When is the flight to Antalya?",
+      "Is TK2424 on time?",
       "What time is the flight to London today?",
     ],
     tts: {
