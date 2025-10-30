@@ -798,28 +798,30 @@ export async function POST(req: NextRequest) {
     );
 
     const settled = await Promise.allSettled(tasks);
-    const collected = settled
-      .filter((r): r is PromiseFulfilledResult<Flight[]> => r.status === "fulfilled")
-      .flatMap((r) => r.value);
+    // Merge unique flights via Map in one pass
+    const uniqueFlights = Array.from(
+      new Map(
+        settled
+          .filter((r): r is PromiseFulfilledResult<Flight[]> => r.status === "fulfilled")
+          .flatMap((r) => r.value)
+          .map((f) => [`${f.flightNumber}-${f.scheduledTimeLocal}-${f.direction}`, f] as const)
+      ).values()
+    );
 
-    // Deduplicate by flightNumber + scheduled
-    const seen = new Set<string>();
-    const uniqueFlights = collected.filter((f) => {
-      const k = `${f.flightNumber}-${f.scheduledTimeLocal}-${f.direction}`;
-      if (seen.has(k)) return false;
-      seen.add(k);
-      return true;
-    });
-
-    if (allowCache) liveFlightsCache = { at: Date.now(), flights: uniqueFlights };
+    if (allowCache) {
+      liveFlightsCache = { at: Date.now(), flights: uniqueFlights };
+      // Background prefetch before TTL expires to keep cache hot
+      setTimeout(() => { loadLiveFlights(true, false).catch(() => {}); }, Math.max(1_000, FLIGHT_CACHE_TTL_MS - 60_000));
+    }
     return uniqueFlights;
   }
 
-  const [liveFlights, dbFlights] = await Promise.all([
-    loadLiveFlights(),
-    fetchFlightsFromDb()
-  ]);
-  let allFlights: Flight[] = liveFlights.length ? liveFlights : (dbFlights.length ? dbFlights : staticFlights);
+  // Optimistic response: start live flights in background, use DB/static immediately
+  const liveFlightsPromise = loadLiveFlights().catch(() => [] as Flight[]);
+  const dbFlights = await fetchFlightsFromDbCached();
+  let allFlights: Flight[] = dbFlights.length ? dbFlights : staticFlights;
+  // When live resolves, refresh cache for next requests
+  liveFlightsPromise.then((f) => { if (f.length) liveFlightsCache = { at: Date.now(), flights: f }; }).catch(() => {});
 
   // Fuzzy filter: score on flightNumber, city (origin/dest), airline
   const qFlight = (merged.flightNumber || "").toUpperCase();
@@ -948,7 +950,8 @@ export async function POST(req: NextRequest) {
           body: JSON.stringify({
             model: "gpt-4o-mini",
             messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-            temperature: 0.2,
+            temperature: 0.1,
+            max_tokens: 256,
           }),
         });
         if (resp.ok) {
@@ -1012,7 +1015,8 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-          temperature: 0.2,
+          temperature: 0.1,
+          max_tokens: 256,
         }),
       });
       if (resp.ok) {

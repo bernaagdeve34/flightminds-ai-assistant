@@ -282,12 +282,10 @@ export default function AssistantPanel({ language, scope }: Props) {
 				))}
 			</div>
 			{answer && (
-				<div className="text-sm text-white/95 whitespace-pre-wrap border-t border-white/20 pt-2 w-full max-w-md">
-					{answer}
-				</div>
-			)}
+        <div className="text-sm text-white/95 whitespace-pre-wrap border-t border-white/20 pt-2 w-full max-w-md max-h-[50vh] overflow-y-auto pr-1">
+          {answer}
+        </div>
+      )}
 		</div>
 	);
 }
-
-
