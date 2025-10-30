@@ -163,7 +163,9 @@ export async function POST(req: NextRequest) {
         : new URL(req.url).origin);
 
   // Early: try FAQ direct answer to avoid mixing with flight/RAG logic
-  try {
+  // BUT: if query clearly asks about flights, skip FAQ and continue to flight branch
+  const looksFlightEarly = /(uçuş|ucus|flight|gate|kalkış|kalkis|varış|varis|arrival|arrive|arriving|departure|depart)/i.test(query);
+  if (!looksFlightEarly) try {
     const faq = await loadFAQ();
     if (faq.length) {
       const nq = normalizeText(query, lang);
