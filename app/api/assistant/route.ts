@@ -5,8 +5,7 @@ import { flights as staticFlights } from "@/lib/data/flights";
 import { filterFlights } from "@/lib/utils";
 import { fetchFlightsFromDb } from "@/lib/db/flights";
 import type { Flight, FlightDirection } from "@/lib/types";
-import { extractQueryWithGemini, extractQueryWithGeminiMeta } from "@/lib/ai/gemini";
-import { extractQueryWithGroq, extractQueryWithGroqMeta } from "@/lib/ai/groq";
+import { extractQueryWithGroq } from "@/lib/ai/groq";
 import { extractQueryWithRules } from "@/lib/ai/rules";
 import { readJson } from "@/lib/diskCache";
 import { IST_ALLOWED_PAGES } from "@/lib/content/istPages";
@@ -14,13 +13,30 @@ import { IST_ALLOWED_PAGES } from "@/lib/content/istPages";
 // Simple in-memory cache for RAG answers (resets on redeploy)
 const ragCache = new Map<string, { at: number; answer: string }>();
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Live flights in-memory cache (speeds up repeated flight queries)
+let liveFlightsCache: { at: number; flights: Flight[] } | null = null;
+const FLIGHT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+// DB flights in-memory cache (5 minutes)
+let dbCache: { at: number; flights: Flight[] } | null = null;
+async function fetchFlightsFromDbCached(): Promise<Flight[]> {
+  if (dbCache && (Date.now() - dbCache.at) < 5 * 60 * 1000) return dbCache.flights;
+  const f = await fetchFlightsFromDb();
+  dbCache = { at: Date.now(), flights: f };
+  return f;
+}
 
 // FAQ cache (CSV: genelsorular.csv)
 type FaqItem = { q: string; a: string; q_en?: string; a_en?: string };
 let faqCache: Array<FaqItem> | null = null;
 const DEFAULT_FAQ_SHEET_URL = "https://docs.google.com/spreadsheets/d/1UxFlL8OcXz0l9i8VpuiPZOcq6YKlkPPEKe9paBg4oXc/export?format=csv&gid=0";
+// Lightweight memoization for normalizeText
+const normCache = new Map<string, string>();
 function normalizeText(s: string, lang: "tr" | "en"): string {
-  return (s || "")
+  const key = `${lang}|${s}`;
+  const hit = normCache.get(key);
+  if (hit) return hit;
+  const out = (s || "")
     .toLocaleLowerCase(lang === "tr" ? "tr-TR" : "en-US")
     .normalize("NFD").replace(/\p{Diacritic}/gu, "")
     .replace(/[^a-z0-9\s]/gi, " ")
@@ -34,6 +50,9 @@ function normalizeText(s: string, lang: "tr" | "en"): string {
     .replace(/\bparking\b/g, "parking")
     .replace(/\babonelik\w*\b/g, "subscription")
     .replace(/\bsubscription\b/g, "subscription");
+  normCache.set(key, out);
+  if (normCache.size > 200) normCache.clear();
+  return out;
 }
 function parseCsvFlexible(csv: string): FaqItem[] {
   // Robust CSV parser supporting commas and newlines inside quotes
@@ -319,7 +338,7 @@ export async function POST(req: NextRequest) {
                 "Content-Type": "application/json",
                 ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
               },
-              body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ], temperature: 0.2 }),
+              body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ], temperature: 0.1, max_tokens: 120 }),
             });
             if (resp.ok) {
               const j = await resp.json().catch(()=>null);
@@ -329,60 +348,9 @@ export async function POST(req: NextRequest) {
           } catch {}
         }
         // last resort
-        return Response.json({ answer: lang === "tr" ? "Bu konuda kesin bir bilgi bulamadım. Lütfen farklı ifade ile tekrar sorar mısınız?" : "Couldn't find definitive info. Please rephrase your question.", matches: [], nluProvider: "faq-empty" });
       }
     }
   } catch {}
-
-  // 0-a) If forced, route ALL questions directly to Gemini and return
-  const GEMINI_ONLY = String(process.env.GEMINI_ONLY || "").toLowerCase() === "true";
-  const GEMINI_API_KEY_DIRECT = process.env.GEMINI_API_KEY?.trim();
-  if (GEMINI_ONLY && GEMINI_API_KEY_DIRECT) {
-    try {
-      const model = process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash";
-      const version = "v1beta";
-      const system = lang === "tr"
-        ? "İstanbul Havalimanı için konuşan bir asistansın. Kullanıcının sorusuna kısa, net ve doğru bir yanıt ver. Uydurma bilgi verme."
-        : "You are an assistant for Istanbul Airport. Provide a short, accurate answer. Do not fabricate.";
-      const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${GEMINI_API_KEY_DIRECT}`;
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            { role: "user", parts: [{ text: system }] },
-            { role: "user", parts: [{ text: query }] },
-          ],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 256 },
-        }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        const gx = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
-        if (gx) {
-          return Response.json({ answer: gx.trim(), matches: [], nluProvider: "gemini-direct" });
-        }
-      } else if (wantDebug) {
-        const txt = await resp.text().catch(() => "");
-        return Response.json({
-          answer: lang === "tr" ? "Gemini yanıtı alınamadı (debug)." : "Gemini response failed (debug).",
-          matches: [],
-          nluProvider: "gemini-direct",
-          debug: { geminiDirect: { status: resp.status, body: txt?.slice(0, 800) } }
-        });
-      }
-    } catch {}
-    // If direct Gemini failed, continue to normal logic
-  }
-
-  // Early flight-like detection to optionally bypass OPENAI_ONLY short-circuit
-  const earlyStrip = (s: string) => s
-    .toLocaleLowerCase(lang === "tr" ? "tr-TR" : "en-US")
-    .normalize("NFD").replace(/\p{Diacritic}/gu, "")
-    .replace(/[^a-z0-9\s]/gi, " ").replace(/\s+/g, " ").trim();
-  const earlyNorm = earlyStrip(query);
-  const flightLike = (/(ucus|uçus|uçuş|sefer|gate|kapi|kapı|kalkis|kalkış|varis|varış|giden|gelen|terminal|flight|flt|uçuş\s*no|flight\s*no)/.test(earlyNorm)
-    || /\b[a-z]{2}\s?\d{2,4}\b/i.test(query));
 
   // 0-b) If forced, route ALL questions directly to OpenAI and return
   const OPENAI_ONLY = String(process.env.OPENAI_ONLY || "").toLowerCase() === "true";
@@ -445,7 +413,7 @@ export async function POST(req: NextRequest) {
       const facts = candidates.map((f,i)=>`[${i+1}] ${f.flightNumber} ${(f.direction === "Arrival" ? f.originCity : f.destinationCity)} ${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal?` / ${fmtTime(f.estimatedTimeLocal)}`:""}${f.direction === "Departure" ? (f.gate?`, Gate ${f.gate}`:"") : (f.baggage?`, ${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}`:"")} — ${f.status}`).join("\n");
 
       const system = lang === "tr"
-        ? "İstanbul Havalimanı için konuşan bir asistansın. UÇUŞ BİLGİLERİ listesini GERÇEK kaynak olarak kullan.\n- Bir eşleşme varsa: tek cümlede saat/kapı/durum ver.\n- Birden fazla eşleşme varsa: tümünü satır satır listele (kısa).\n- Eşleşme yoksa: kibarca belirt ve yakın seçenek önerme. Uydurma bilgi verme."
+        ? "İstanbul Havalimanı için konuşan bir asistansın. UÇUŞ BİLGİLERİ listesini GERÇEK kaynak olarak kullan.\n- Bir eşleşme varsa: tek cümlede saat/kapı/durum ver.\n- Birden fazla eşleşme varsa: tümünü satır satır listele (kısa).\n- Eşleşme yoksa: kibarca belirt ve ilgili sayfayı öner."
         : "You are an assistant for Istanbul Airport. Use FLIGHT FACTS as ground truth. If exactly one match: one concise sentence with time/gate/status. If multiple: list ALL matches line by line (short). If none: say so politely; do not fabricate.";
       const userMsg = facts ? `${query}\n\nFLIGHT FACTS:\n${facts}` : query;
 
@@ -459,7 +427,8 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-          temperature: 0.2,
+          temperature: 0.1,
+          max_tokens: 120,
         }),
       });
       if (resp.ok) {
@@ -471,23 +440,16 @@ export async function POST(req: NextRequest) {
     // If direct OpenAI failed, continue to normal logic
   }
 
-  // 1) Try NLU providers: Gemini -> Groq -> Rules
-  let nluProvider: "gemini" | "groq" | "rules" | undefined;
-  let nlu = await extractQueryWithGemini(query);
-  const geminiMeta = wantDebug ? await extractQueryWithGeminiMeta(query) : null;
+  // 1) Try NLU providers: Groq -> Rules
+  let nluProvider: "groq" | "rules" | undefined;
+  let nlu = await extractQueryWithGroq(query);
   if (nlu) {
-    nluProvider = "gemini";
+    nluProvider = "groq";
   } else {
-    const groq = await extractQueryWithGroq(query);
-    if (groq) {
-      nlu = groq;
-      nluProvider = "groq";
-    } else {
-      const rules = extractQueryWithRules(query);
-      if (rules.city || rules.type || rules.flightNumber) {
-        nlu = rules;
-        nluProvider = "rules";
-      }
+    const rules = extractQueryWithRules(query);
+    if (rules.city || rules.type || rules.flightNumber) {
+      nlu = rules;
+      nluProvider = "rules";
     }
   }
 
@@ -574,13 +536,35 @@ export async function POST(req: NextRequest) {
       const faq = await loadFAQ();
       if (faq.length) {
         const nq = normalizeText(query, lang);
-        const scored = faq.map((x, i) => ({ i, s: similarity(nq, normalizeText(x.q, lang)) }))
+        const scored = faq.map((x, i) => ({ i, s: similarity(nq, normalizeText(lang === 'en' ? (x.q_en || x.q) : x.q, lang)) }))
           .sort((a,b)=> b.s - a.s);
         const bestIdx = scored.length ? scored[0].i : -1;
         const best = scored.length ? scored[0].s : 0;
         if (bestIdx >= 0 && best >= 0.20) {
-          const ans = faq[bestIdx].a || faq[bestIdx].q;
-          return Response.json({ answer: ans, matches: [], nluProvider: "faq-csv", faq: { score: best, q: faq[bestIdx].q } });
+          const item = faq[bestIdx];
+          const ansRaw = (lang === 'en' ? (item.a_en || '') : item.a).trim();
+          if (ansRaw) {
+            return Response.json({ answer: ansRaw, matches: [], nluProvider: "faq-csv", faq: { score: best, q: (lang === 'en' ? (item.q_en || item.q) : item.q) } });
+          }
+          if (lang === 'en' && (item.a || '').trim()) {
+            const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
+            const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
+            if (OPENAI_API_KEY_FAQ) {
+              try {
+                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+                  method: "POST",
+                  headers: { "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`, "Content-Type": "application/json", ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}) },
+                  body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: "Translate the following Turkish answer into clear, concise English. Do not add or remove information. Preserve line breaks." }, { role: "user", content: item.a } ], temperature: 0.1, max_tokens: 120 })
+                });
+                if (resp.ok) {
+                  const j = await resp.json().catch(()=>null);
+                  const content = j?.choices?.[0]?.message?.content?.trim();
+                  if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-translate", faq: { score: best, q: (item.q_en || item.q) } });
+                }
+              } catch {}
+            }
+            return Response.json({ answer: item.a, matches: [], nluProvider: "faq-tr-fallback", faq: { score: best, q: item.q } });
+          }
         }
         // Weak match policy:
         // - For EN queries: do NOT compose an answer from facts. Pick the best FAQ and translate its TR answer deterministically.
@@ -721,35 +705,7 @@ export async function POST(req: NextRequest) {
           ? `${answerText}\n\nKaynaklar:\n${sources}`
           : `${answerText}\n\nSources:\n${sources}`;
 
-        // Optional: Synthesize with Gemini first (if key exists), otherwise OpenAI, otherwise Groq
-        const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
-        if (GEMINI_API_KEY) {
-          try {
-            const model = process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash";
-            const version = "v1beta";
-            const system = lang === "tr"
-              ? "İstanbul Havalimanı asistanısın. Aşağıdaki pasajlara dayanarak kısa, doğru ve kaynaklı bir yanıt ver. Uydurma bilgi verme. En sonda 'Kaynaklar:' başlığı altında maddeler halinde linkleri bırak."
-              : "You are an assistant for Istanbul Airport. Using the passages below, produce a short, accurate, sourced answer. Do not fabricate. End with 'Sources:' listing the links.";
-            const userMsg = `${query}\n\nPASSAGES:\n${top.map((h,i)=>`[${i+1}] ${h.snippet} (${h.url})`).join("\n")}`;
-            const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-            const resp = await fetch(url, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contents: [
-                  { role: "user", parts: [{ text: system }] },
-                  { role: "user", parts: [{ text: userMsg }] },
-                ],
-                generationConfig: { temperature: 0.2, maxOutputTokens: 256 },
-              }),
-            });
-            if (resp.ok) {
-              const data = await resp.json();
-              const gx = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
-              if (gx) answer = gx.trim();
-            }
-          } catch {}
-        }
+        // Synthesize with OpenAI if key exists
 
         // Optional: Synthesize with OpenAI if key exists
         const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
@@ -770,7 +726,8 @@ export async function POST(req: NextRequest) {
               body: JSON.stringify({
                 model: "gpt-4o-mini",
                 messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-                temperature: 0.2,
+                temperature: 0.1,
+                max_tokens: 120,
               }),
             });
             const j = await resp.json().catch(() => null);
@@ -782,44 +739,27 @@ export async function POST(req: NextRequest) {
         ragCache.set(cacheKey, { at: Date.now(), answer });
         return Response.json({ answer, matches: [], nluProvider: nluProvider ?? "rag" });
       }
-      // No passages found: ask Gemini/OpenAI/Groq directly (as last resort)
-      const GEMINI_API_KEY2 = process.env.GEMINI_API_KEY?.trim();
-      if (GEMINI_API_KEY2) {
-        try {
-          const model = process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash";
-          const version = "v1beta";
-          const system = lang === "tr"
-            ? "İstanbul Havalimanı (IST) asistanısın. Soruyu kısaca yanıtla. Bilmiyorsan uydurma, 'Buna dair kesin bilgi bulamadım' de ve ilgili sayfaya yönlendir."
-            : "You are an assistant for Istanbul Airport (IST). Answer briefly. If uncertain, say you couldn't find definitive info and suggest the relevant page.";
-          const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${GEMINI_API_KEY2}`;
-          const resp = await fetch(url, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ contents: [ { role: "user", parts: [{ text: system }] }, { role: "user", parts: [{ text: query }] } ], generationConfig: { temperature: 0.2, maxOutputTokens: 200 } }),
-          });
-          if (resp.ok) {
-            const data = await resp.json();
-            const gx = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
-            if (gx) return Response.json({ answer: gx.trim(), matches: [], nluProvider: nluProvider ?? "gemini-direct" });
-          }
-        } catch {}
-      }
+      // No passages found: fall back to a brief default
     } catch {}
     // As last resort
     return Response.json({ answer: lang === "tr" ? "Bu konuda bilgi bulamadım. Lütfen sorunuzu farklı ifade edin." : "I couldn't find information on this. Please rephrase your question." });
   }
 
   // 0) Build flight list from ISTAirport live proxy (both directions, domestic & international)
-  async function loadLiveFlights(forceAllScopes: boolean = false): Promise<Flight[]> {
+  async function loadLiveFlights(forceAllScopes: boolean = false, allowCache: boolean = true): Promise<Flight[]> {
+    // Fast path: serve from cache if fresh
+    if (allowCache && liveFlightsCache && (Date.now() - liveFlightsCache.at) < FLIGHT_CACHE_TTL_MS) {
+      return liveFlightsCache.flights;
+    }
     const directions: Array<{ nature: string; direction: FlightDirection }> = [
       { nature: "1", direction: "Departure" },
       { nature: "0", direction: "Arrival" },
     ];
     const scopes = forceAllScopes ? ["0", "1"] : (scope ? [scope === "international" ? "1" : "0"] : ["0", "1"]); // 0: domestic, 1: international
 
-    const results: Flight[] = [];
-    for (const d of directions) {
-      for (const isInternational of scopes) {
+    // Build parallel tasks for all combinations
+    const tasks = directions.flatMap((d) =>
+      scopes.map((isInternational) => {
         const body = new URLSearchParams({
           nature: d.nature,
           searchTerm: "",
@@ -828,61 +768,58 @@ export async function POST(req: NextRequest) {
           date: "",
           endDate: "",
           culture: lang === "tr" ? "tr" : "en",
-          clickedButton: "",
         }).toString();
-        try {
-          const resp = await fetch(`${thisOrigin}/api/istairport/status`, {
-            method: "POST",
-            headers: { "Content-Type": "application/x-www-form-urlencoded" },
-            cache: "no-store",
-            body,
-          });
-          const json = await resp.json().catch(() => ({} as any));
-          const flights: any[] = (json?.data ?? json)?.result?.data?.flights || [];
-          const statusMap = (s?: string) => {
-            const v = (s || "").toLowerCase();
-            if (v.includes("iptal") || v.includes("cancel")) return "Cancelled" as const;
-            if (v.includes("gecik") || v.includes("delay")) return "Delayed" as const;
-            if (v.includes("indi") || v.includes("land")) return "Landed" as const;
-            if (v.includes("erken") || v.includes("early")) return "Early" as any;
-            return "On Time" as const;
-          };
-          for (const f of flights) {
-            results.push({
-              id: `${String(f?.flightNumber)}-${d.direction === "Arrival" ? "ARR" : "DEP"}-${String(f?.scheduledDatetime)}`,
+        return fetch(`${thisOrigin}/api/istairport/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          cache: "no-store",
+          body,
+        })
+          .then((r) => r.json().catch(() => ({})))
+          .then((json) => {
+            const flights: any[] = json?.data?.result?.data?.flights || [];
+            return flights.map((f) => ({
+              id: `${f.flightNumber}-${d.direction}`,
               airportCode: "IST",
-              flightNumber: String(f?.flightNumber || ""),
-              airline: String(f?.airlineName || f?.airlineCode || ""),
+              flightNumber: f.flightNumber,
+              airline: f.airlineName,
               direction: d.direction,
-              originCity: String(f?.fromCityName || f?.fromCityCode || ""),
-              destinationCity: String(f?.toCityName || f?.toCityCode || ""),
-              scheduledTimeLocal: String(f?.scheduledDatetime || ""),
-              estimatedTimeLocal: f?.estimatedDatetime ? String(f?.estimatedDatetime) : undefined,
-              status: statusMap(f?.remark || f?.remarkCode),
-              gate: d.direction === "Departure" ? (f?.gate ? String(f.gate) : undefined) : undefined,
-              baggage: d.direction === "Arrival" ? (f?.carousel ? String(f.carousel) : undefined) : undefined,
-            } as Flight);
-          }
-        } catch {
-          // ignore this combination
-        }
-      }
-    }
+              originCity: f.fromCityName,
+              destinationCity: f.toCityName,
+              scheduledTimeLocal: f.scheduledDatetime,
+              estimatedTimeLocal: f.estimatedDatetime,
+              status: f.remark,
+              gate: f.gate,
+              baggage: f.carousel,
+            })) as Flight[];
+          })
+          .catch(() => [] as Flight[]);
+      })
+    );
+
+    const settled = await Promise.allSettled(tasks);
+    const collected = settled
+      .filter((r): r is PromiseFulfilledResult<Flight[]> => r.status === "fulfilled")
+      .flatMap((r) => r.value);
+
     // Deduplicate by flightNumber + scheduled
     const seen = new Set<string>();
-    return results.filter((f) => {
+    const uniqueFlights = collected.filter((f) => {
       const k = `${f.flightNumber}-${f.scheduledTimeLocal}-${f.direction}`;
       if (seen.has(k)) return false;
       seen.add(k);
       return true;
     });
+
+    if (allowCache) liveFlightsCache = { at: Date.now(), flights: uniqueFlights };
+    return uniqueFlights;
   }
 
-  let allFlights: Flight[] = await loadLiveFlights();
-  if (!allFlights.length) {
-    // Fallback to DB or static as last resort
-    allFlights = (await fetchFlightsFromDb()).length ? await fetchFlightsFromDb() : staticFlights;
-  }
+  const [liveFlights, dbFlights] = await Promise.all([
+    loadLiveFlights(),
+    fetchFlightsFromDb()
+  ]);
+  let allFlights: Flight[] = liveFlights.length ? liveFlights : (dbFlights.length ? dbFlights : staticFlights);
 
   // Fuzzy filter: score on flightNumber, city (origin/dest), airline
   const qFlight = (merged.flightNumber || "").toUpperCase();
@@ -963,10 +900,18 @@ export async function POST(req: NextRequest) {
       let s = 0;
       const oc = strip(f.originCity);
       const dc = strip(f.destinationCity);
-      let hit = 0; for (const t of tokens) { if (oc.includes(t) || dc.includes(t)) hit++; }
-      if (hit >= 2) s += 5; else if (hit === 1) s += 2;
+      let hit = 0;
+      for (const t of tokens) {
+        if (oc.includes(t) || dc.includes(t)) hit++;
+      }
+      if (hit >= 2) s += 5; // both parts matched (e.g., kocaseyit + edremit)
+      else if (hit === 1) s += 2;
       // prefer future
-      try { const t = new Date(f.scheduledTimeLocal).getTime(); const now = Date.now(); if (t >= now - 5*60*1000) s += 2; } catch {}
+      try {
+        const t = new Date(f.scheduledTimeLocal).getTime();
+        const now = Date.now();
+        if (t >= now - 5*60*1000) s += 2;
+      } catch {}
       return { f, s };
     });
     result = rescored.filter(x => x.s > 0).sort((a,b)=> b.s - a.s).map(x=>x.f).slice(0, 10);
@@ -1018,7 +963,6 @@ export async function POST(req: NextRequest) {
     return Response.json({
       answer: lang === "tr" ? "Uçuş bulunamadı. Lütfen uçuş numarası veya şehir adını netleştirerek tekrar dener misiniz?" : "No matching flights found. Please try again with a flight number or clearer city name.",
       matches: [],
-      gemini: geminiMeta ?? undefined,
       nluProvider,
     });
   }
@@ -1043,41 +987,6 @@ export async function POST(req: NextRequest) {
         ? `Eşleşen uçuşlar:\n${lines.join("\n")}\nİsterseniz uçuş numarasıyla sorabilirsiniz.`
         : `Matching flights:\n${lines.join("\n")}\nYou can ask by flight number for a specific one.`)
     : (lang === "tr" ? `Uçuş: ${bestLine}` : `Flight: ${bestLine}`);
-
-  // If Gemini is available, let it produce the final phrasing using flight facts
-  const GEMINI_API_KEY = process.env.GEMINI_API_KEY?.trim();
-  if (GEMINI_API_KEY && !wantsList) {
-    try {
-      const model = process.env.GEMINI_MODEL?.trim() || "gemini-1.5-flash";
-      const version = "v1beta";
-      const system = lang === "tr"
-        ? "İstanbul Havalimanı uçuş asistanısın. Kullanıcı sorusunu ve aşağıdaki UÇUŞ BİLGİLERİ listesini kullanarak tek cümlede net bir yanıt üret. Zamanı HH:MM biçiminde yaz. Uydurma bilgi verme."
-        : "You are an assistant for Istanbul Airport. Using the user's question and the FLIGHT FACTS below, produce one concise sentence with the key time/gate/baggage. Do not fabricate.";
-      const facts = result.slice(0, 5).map((f, i) => (
-        `[${i+1}] ${f.flightNumber} ${f.direction === "Arrival" ? f.originCity : f.destinationCity} ` +
-        `${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal ? ` / ${fmtTime(f.estimatedTimeLocal)}` : ""}` +
-        `${f.direction === "Departure" ? (f.gate ? `, Gate ${f.gate}` : "") : (f.baggage ? `, ${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}` : "")} — ${f.status}`
-      )).join("\n");
-      const userMsg = `${query}\n\nFLIGHT FACTS:\n${facts}`;
-      const url = `https://generativelanguage.googleapis.com/${version}/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          contents: [
-            { role: "user", parts: [{ text: system }] },
-            { role: "user", parts: [{ text: userMsg }] },
-          ],
-          generationConfig: { temperature: 0.2, maxOutputTokens: 120 },
-        }),
-      });
-      if (resp.ok) {
-        const data = await resp.json();
-        const gx = data?.candidates?.[0]?.content?.parts?.[0]?.text as string | undefined;
-        if (gx) answer = gx.trim();
-      }
-    } catch {}
-  }
 
   // If OpenAI is available, let it produce the final phrasing using the same flight facts
   const OPENAI_API_KEY_FLIGHTS = process.env.OPENAI_API_KEY?.trim();
@@ -1114,5 +1023,5 @@ export async function POST(req: NextRequest) {
     } catch {}
   }
 
-  return Response.json({ answer, matches: result, gemini: geminiMeta ?? undefined, nluProvider });
+  return Response.json({ answer, matches: result, nluProvider });
 }

@@ -98,9 +98,9 @@ export default function Home() {
   const departures = allFlights.filter((f) => f.direction === "Departure").sort(byTime);
   const arrivals = allFlights.filter((f) => f.direction === "Arrival").sort(byTime);
   return (
-    <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-fuchsia-50">
+    <div className="min-h-screen">
       {showIntro && <SplashIntro language={lang} durationMs={3000} onDone={() => setShowIntro(false)} />}
-      <header className="sticky top-0 z-40 flex items-center justify-between px-4 sm:px-6 lg:px-8 py-3 bg-white text-gray-900 border-b shadow-sm">
+      <header className="sticky top-0 z-40 flex items-center justify-between px-4 sm:px-6 lg:px-8 py-3 bg-white text-gray-900 border-b border-gray-200/60 shadow-none">
         <div className="flex items-center gap-3">
           <img src="/ist_logtwo.png" alt="IST" className="h-8 w-8 object-contain" />
           <h1 className="text-lg font-semibold">{t.pageTitle}</h1>
