@@ -950,8 +950,7 @@ export async function POST(req: NextRequest) {
           body: JSON.stringify({
             model: "gpt-4o-mini",
             messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-            temperature: 0.1,
-            max_tokens: 256,
+            temperature: 0.2,
           }),
         });
         if (resp.ok) {
@@ -1015,8 +1014,7 @@ export async function POST(req: NextRequest) {
         body: JSON.stringify({
           model: "gpt-4o-mini",
           messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-          temperature: 0.1,
-          max_tokens: 256,
+          temperature: 0.2,
         }),
       });
       if (resp.ok) {

@@ -16,6 +16,18 @@ export default function AssistantPanel({ language, scope }: Props) {
   const [input, setInput] = React.useState<string>("");
   const [speakEnabled, setSpeakEnabled] = React.useState(true);
   const [speaking, setSpeaking] = React.useState(false);
+  const displayAnswer = React.useMemo(() => {
+    if (!answer) return "";
+    const lines = answer
+      .split(/\r?\n/)
+      .map((l) => l.replace(/\s+$/g, ""))
+      .filter((l) => l.trim().length > 0);
+    // Prefer bullet-like lines (e.g., -, •, [1], 1.) to ensure we show 4 flight rows
+    const bulletRe = /^(\-|•|\[\d+\]|\d+\.)\s?/;
+    const bullets = lines.filter((l) => bulletRe.test(l.trim()));
+    const pick = bullets.length >= 4 ? bullets.slice(0, 4) : lines.slice(0, 4);
+    return pick.join("\n");
+  }, [answer]);
   const t = i18n[language];
   const synthRef = React.useRef<SpeechSynthesis | null>(null);
   const mediaRecRef = React.useRef<MediaRecorder | null>(null);
@@ -281,11 +293,11 @@ export default function AssistantPanel({ language, scope }: Props) {
 					</button>
 				))}
 			</div>
-			{answer && (
-        <div className="text-sm text-white/95 whitespace-pre-wrap border-t border-white/20 pt-2 w-full max-w-md max-h-[50vh] overflow-y-auto pr-1">
-          {answer}
-        </div>
-      )}
+			{displayAnswer && (
+				<div className="text-sm text-white/95 whitespace-pre-wrap border-t border-white/20 pt-2 w-full max-w-md">
+					{displayAnswer}
+				</div>
+			)}
 		</div>
 	);
 }
