@@ -12,6 +12,9 @@ import { IST_ALLOWED_PAGES } from "@/lib/content/istPages";
 
 // Simple in-memory cache for RAG answers (resets on redeploy)
 const ragCache = new Map<string, { at: number; answer: string }>();
+// Quick response cache for repeated questions (5 minutes)
+const quickRespCache = new Map<string, { at: number; data: any }>();
+const QUICK_RESP_TTL_MS = 5 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Live flights in-memory cache (speeds up repeated flight queries)
 let liveFlightsCache: { at: number; flights: Flight[] } | null = null;
@@ -161,6 +164,30 @@ export async function POST(req: NextRequest) {
     : (process.env.VERCEL_URL
         ? `https://${process.env.VERCEL_URL.replace(/\/$/, "")}`
         : new URL(req.url).origin);
+
+  // Quick response cache hit
+  const quickKey = `${lang}|${query.trim().toLowerCase()}`;
+  const quickHit = quickRespCache.get(quickKey);
+  if (quickHit && (Date.now() - quickHit.at) < QUICK_RESP_TTL_MS) {
+    return Response.json(quickHit.data);
+  }
+
+  // Fast-path: direct flight number like TK2701
+  const flightNumQuick = query.match(/\b([A-Za-z]{2})\s?(\d{2,4})\b/);
+  if (flightNumQuick && liveFlightsCache && liveFlightsCache.flights?.length) {
+    const num = `${flightNumQuick[1].toUpperCase()} ${flightNumQuick[2]}`;
+    const compact = num.replace(/\s+/g, "");
+    const hit = liveFlightsCache.flights.find(f => f.flightNumber.replace(/\s+/g, "") === compact);
+    if (hit) {
+      const t = (()=>{ try { return new Date(hit.scheduledTimeLocal).toLocaleTimeString(lang === 'tr' ? 'tr-TR' : 'en-US', {hour:'2-digit', minute:'2-digit'});} catch { return hit.scheduledTimeLocal||''; }})();
+      const answer = lang === 'tr'
+        ? `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Kapı ${hit.gate}`:''} — ${hit.status}`
+        : `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Gate ${hit.gate}`:''} — ${hit.status}`;
+      const data = { answer, matches: [hit], nluProvider: 'fastpath' };
+      quickRespCache.set(quickKey, { at: Date.now(), data });
+      return Response.json(data);
+    }
+  }
 
   // Early: try FAQ direct answer to avoid mixing with flight/RAG logic
   // BUT: if query clearly asks about flights, skip FAQ and continue to flight branch
@@ -442,16 +469,18 @@ export async function POST(req: NextRequest) {
     // If direct OpenAI failed, continue to normal logic
   }
 
-  // 1) Try NLU providers: Groq -> Rules
+  // 1) Try NLU providers concurrently: Groq || Rules (pick first available)
   let nluProvider: "groq" | "rules" | undefined;
-  let nlu = await extractQueryWithGroq(query);
-  if (nlu) {
-    nluProvider = "groq";
-  } else {
-    const rules = extractQueryWithRules(query);
-    if (rules.city || rules.type || rules.flightNumber) {
-      nlu = rules;
-      nluProvider = "rules";
+  const [groqRes, rulesRes] = await Promise.allSettled([
+    extractQueryWithGroq(query),
+    Promise.resolve(extractQueryWithRules(query))
+  ]);
+  let nlu = groqRes.status === 'fulfilled' ? groqRes.value : undefined;
+  if (nlu) nluProvider = 'groq';
+  if (!nlu) {
+    const rules = rulesRes.status === 'fulfilled' ? rulesRes.value : undefined;
+    if (rules && (rules.city || rules.type || rules.flightNumber)) {
+      nlu = rules; nluProvider = 'rules';
     }
   }
 
@@ -648,7 +677,7 @@ export async function POST(req: NextRequest) {
       type Hit = { score: number; snippet: string; url: string; title?: string };
       const hits: Hit[] = [];
       // Fetch a subset in parallel (cap to 8 for speed)
-      const pages = IST_ALLOWED_PAGES.slice(0, 8);
+      const pages = IST_ALLOWED_PAGES.slice(0, 4);
       const resps = await Promise.allSettled(
         pages.map(p => fetch(p.url, { cache: "no-store" })
           .then(r => r.text())
@@ -818,12 +847,14 @@ export async function POST(req: NextRequest) {
     return uniqueFlights;
   }
 
-  // Optimistic response: start live flights in background, use DB/static immediately
-  const liveFlightsPromise = loadLiveFlights().catch(() => [] as Flight[]);
-  const dbFlights = await fetchFlightsFromDbCached();
-  let allFlights: Flight[] = dbFlights.length ? dbFlights : staticFlights;
-  // When live resolves, refresh cache for next requests
-  liveFlightsPromise.then((f) => { if (f.length) liveFlightsCache = { at: Date.now(), flights: f }; }).catch(() => {});
+  // Parallelize DB + Live and prefer whichever arrives with data
+  const [dbRes, liveRes] = await Promise.allSettled([
+    fetchFlightsFromDbCached(),
+    loadLiveFlights()
+  ]);
+  const dbFlights = dbRes.status === 'fulfilled' ? dbRes.value : [];
+  const liveFlights = liveRes.status === 'fulfilled' ? liveRes.value : [];
+  let allFlights: Flight[] = liveFlights.length ? liveFlights : (dbFlights.length ? dbFlights : staticFlights);
 
   // Fuzzy filter: score on flightNumber, city (origin/dest), airline
   const qFlight = (merged.flightNumber || "").toUpperCase();
@@ -1027,5 +1058,8 @@ export async function POST(req: NextRequest) {
     } catch {}
   }
 
-  return Response.json({ answer, matches: result, nluProvider });
+  const finalData = { answer, matches: result, nluProvider };
+  // Store quick cache for repeated queries
+  try { quickRespCache.set(quickKey, { at: Date.now(), data: finalData }); } catch {}
+  return Response.json(finalData);
 }
