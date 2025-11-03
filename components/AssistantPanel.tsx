@@ -67,7 +67,7 @@ export default function AssistantPanel({ language, scope }: Props) {
     } catch {
       setAnswer("");
     }
-  }, [language, speakEnabled, speak, stopSpeak]);
+  }, [language, scope, speakEnabled, speak, stopSpeak]);
 
   // Whisper tabanlı kayıt (tercih edilen)
   const startWhisperRecording = React.useCallback(async () => {

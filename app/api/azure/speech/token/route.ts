@@ -12,7 +12,7 @@ function json(data: unknown, init?: ResponseInit) {
 export async function POST() {
   try {
     const key = process.env.AZURE_SPEECH_KEY?.trim();
-    const region = process.env.AZURE_SPEECH_REGION?.trim() || "westeurope";
+    const region = process.env.AZURE_SPEECH_REGION?.trim() || "eastus2";
     if (!key) {
       return json({ ok: false, error: "AZURE_SPEECH_KEY is missing" });
     }

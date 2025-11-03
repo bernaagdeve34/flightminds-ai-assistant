@@ -6,6 +6,7 @@ import { filterFlights } from "@/lib/utils";
 import { fetchFlightsFromDb } from "@/lib/db/flights";
 import type { Flight, FlightDirection } from "@/lib/types";
 import { extractQueryWithGroq } from "@/lib/ai/groq";
+import { groqChatSmart } from "@/lib/ai/groqChatSmart";
 import { extractQueryWithRules } from "@/lib/ai/rules";
 import { readJson } from "@/lib/diskCache";
 import { IST_ALLOWED_PAGES } from "@/lib/content/istPages";
@@ -152,12 +153,16 @@ function similarity(a: string, b: string): number {
 }
 
 export async function POST(req: NextRequest) {
+  // Read input
   const body = await req.json().catch(() => null);
   const query: string = body?.query ?? "";
-  const lang: "tr" | "en" = body?.lang === "en" ? "en" : "tr";
+  const rawLang = typeof body?.lang === 'string' ? String(body.lang).toLowerCase().trim() : '';
+  const lang: "tr" | "en" = rawLang === "en" ? "en" : "tr";
+  // Auto-detect Turkish if the user typed in TR while UI language is EN
+  const looksTurkish = /[çğıöşü]/i.test(query) || /(uçuş|nerede|ne zaman|var mı|dış hat|iç hat|hangi|gelen|giden)/i.test(query.toLowerCase());
+  const effLang: "tr" | "en" = looksTurkish ? "tr" : lang;
   const scope: "domestic" | "international" | undefined =
     body?.scope === "international" ? "international" : body?.scope === "domestic" ? "domestic" : undefined;
-  const wantDebug: boolean = !!body?.debug;
   // Resolve absolute base URL for internal API calls (Vercel requires absolute URLs on server)
   const thisOrigin = (process.env.NEXT_PUBLIC_BASE_URL && process.env.NEXT_PUBLIC_BASE_URL.trim())
     ? process.env.NEXT_PUBLIC_BASE_URL.trim().replace(/\/$/, "")
@@ -166,7 +171,7 @@ export async function POST(req: NextRequest) {
         : new URL(req.url).origin);
 
   // Quick response cache hit
-  const quickKey = `${lang}|${query.trim().toLowerCase()}`;
+  const quickKey = `${lang}|${scope || 'all'}|${query.trim().toLowerCase()}`;
   const quickHit = quickRespCache.get(quickKey);
   if (quickHit && (Date.now() - quickHit.at) < QUICK_RESP_TTL_MS) {
     return Response.json(quickHit.data);
@@ -183,290 +188,10 @@ export async function POST(req: NextRequest) {
       const answer = lang === 'tr'
         ? `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Kapı ${hit.gate}`:''} — ${hit.status}`
         : `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Gate ${hit.gate}`:''} — ${hit.status}`;
-      const data = { answer, matches: [hit], nluProvider: 'fastpath' };
+      const data = { answer, matches: [hit], nluProvider: 'flights' };
       quickRespCache.set(quickKey, { at: Date.now(), data });
       return Response.json(data);
     }
-  }
-
-  // Early: try FAQ direct answer to avoid mixing with flight/RAG logic
-  // BUT: if query clearly asks about flights, skip FAQ and continue to flight branch
-  const looksFlightEarly = /(uçuş|ucus|flight|gate|kalkış|kalkis|varış|varis|arrival|arrive|arriving|departure|depart)/i.test(query);
-  if (!looksFlightEarly) try {
-    const faq = await loadFAQ();
-    if (faq.length) {
-      const nq = normalizeText(query, lang);
-      // If specific intents exist, restrict candidate FAQs accordingly
-      const needWifiKiosk = /\bwifi\b/.test(nq) && /\bkiosk\b/.test(nq);
-      const isLocationIntent = /(nerede|konum|noktalar|lokasyon|where|location|points)/i.test(query);
-      const needFastTrackLocation = /\bfasttrack\b/.test(nq) && isLocationIntent;
-      const needParkingSubscription = /\bparking\b/.test(nq) && /\bsubscription\b/.test(nq);
-      const cand = needWifiKiosk
-        ? faq.filter(x => { const qq = (lang === 'en' ? (x.q_en || x.q) : x.q); const qn = normalizeText(qq, lang); return /\bwifi\b/.test(qn) && /\bkiosk\b/.test(qn); })
-        : needFastTrackLocation
-          ? faq.filter(x => { const qq = (lang === 'en' ? (x.q_en || x.q) : x.q); const qn = normalizeText(qq, lang); return /\bfasttrack\b/.test(qn) && /(nerede|konum|noktalar|lokasyon|where|location|points)/.test(qq.toLowerCase()); })
-          : needParkingSubscription
-            ? faq.filter(x => { const qq = (lang === 'en' ? (x.q_en || x.q) : x.q); const qn = normalizeText(qq, lang); return /\bparking\b/.test(qn) && /\bsubscription\b/.test(qn); })
-            : faq;
-      // Deterministic FastTrack location answer to avoid wrong matches
-      if (needFastTrackLocation) {
-        const ftItem = faq.find(x => {
-          const qnTr = normalizeText(x.q, 'tr');
-          return /\bfasttrack\b/.test(qnTr) && /(nerede|noktalar|lokasyon)/.test(x.q.toLowerCase());
-        }) || cand[0];
-        if (ftItem) {
-          const ansRaw = (lang === 'en' ? (ftItem.a_en || '') : ftItem.a).trim();
-          if (ansRaw) {
-            return Response.json({ answer: ansRaw, matches: [], nluProvider: 'faq-csv', faq: { score: 1, q: (lang==='en' ? (ftItem.q_en || ftItem.q) : ftItem.q) } });
-          }
-          if (lang === 'en' && (ftItem.a || '').trim()) {
-            const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-            const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-            if (OPENAI_API_KEY_FAQ) {
-              try {
-                const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-                  method: 'POST',
-                  headers: { 'Authorization': `Bearer ${OPENAI_API_KEY_FAQ}`, 'Content-Type': 'application/json', ...(OPENAI_PROJECT_ID_FAQ ? { 'OpenAI-Project': OPENAI_PROJECT_ID_FAQ } : {}) },
-                  body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Translate the following Turkish answer into clear, concise English. Do not add extra information.' }, { role: 'user', content: ftItem.a } ], temperature: 0.1 })
-                });
-                if (resp.ok) {
-                  const j = await resp.json().catch(()=>null);
-                  const content = j?.choices?.[0]?.message?.content?.trim();
-                  if (content) return Response.json({ answer: content, matches: [], nluProvider: 'faq-translate', faq: { score: 1, q: (ftItem.q_en || ftItem.q) } });
-                }
-              } catch {}
-            }
-          }
-          return Response.json({ answer: lang === 'tr' ? 'Bu konuda kesin bir bilgi bulamadım. Lütfen farklı ifade ile tekrar sorar mısınız?' : "Couldn't find definitive info. Please rephrase your question.", matches: [], nluProvider: 'faq-empty' });
-        }
-      }
-      // 1) Exact/substring normalized match shortcut
-      const candsNorm = cand.map((x, i) => ({ i, item: x, qn: normalizeText(lang === 'en' ? (x.q_en || x.q) : x.q, lang) }));
-      const exact = candsNorm.find(c => c.qn === nq);
-      const contains = !exact ? candsNorm.find(c => (c.qn.length > 6 && (c.qn.includes(nq) || nq.includes(c.qn)))) : undefined;
-      const direct = exact || contains;
-      if (direct) {
-        const item = direct.item;
-        const ansRaw = (lang === 'en' ? (item.a_en || '') : item.a).trim();
-        if (ansRaw) {
-          return Response.json({ answer: ansRaw, matches: [], nluProvider: 'faq-csv', faq: { score: 1, q: (lang==='en' ? (item.q_en || item.q) : item.q) } });
-        }
-        if (lang === 'en' && (item.a || '').trim()) {
-          const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-          const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-          if (OPENAI_API_KEY_FAQ) {
-            try {
-              const resp = await fetch('https://api.openai.com/v1/chat/completions', {
-                method: 'POST',
-                headers: { 'Authorization': `Bearer ${OPENAI_API_KEY_FAQ}`, 'Content-Type': 'application/json', ...(OPENAI_PROJECT_ID_FAQ ? { 'OpenAI-Project': OPENAI_PROJECT_ID_FAQ } : {}) },
-                body: JSON.stringify({ model: 'gpt-4o-mini', messages: [ { role: 'system', content: 'Translate the following Turkish answer into clear, concise English. Do not add extra information.' }, { role: 'user', content: item.a } ], temperature: 0.1 })
-              });
-              if (resp.ok) {
-                const j = await resp.json().catch(()=>null);
-                const content = j?.choices?.[0]?.message?.content?.trim();
-                if (content) return Response.json({ answer: content, matches: [], nluProvider: 'faq-translate', faq: { score: 1, q: (item.q_en || item.q) } });
-              }
-            } catch {}
-          }
-        }
-        return Response.json({ answer: lang === 'tr' ? 'Bu konuda kesin bir bilgi bulamadım. Lütfen farklı ifade ile tekrar sorar mısınız?' : "Couldn't find definitive info. Please rephrase your question.", matches: [], nluProvider: 'faq-empty' });
-      }
-
-      // 2) Similarity scoring fallback
-      let scored = cand.map((x, i) => {
-        const qtext = lang === 'en' ? (x.q_en || x.q) : x.q;
-        const base = similarity(nq, normalizeText(qtext, lang));
-        // small boost if location intent words appear in candidate question
-        const locBoost = isLocationIntent && /(nerede|konum|noktalar|lokasyon|where|location|points)/.test((qtext||"").toLowerCase()) ? 0.08 : 0;
-        const ftBoost = /\bfasttrack\b/.test(nq) && /\bfast\s*track\b|\bfasttrack\b/.test((qtext||"").toLowerCase()) ? 0.06 : 0;
-        return { i, s: base + locBoost + ftBoost };
-      }).sort((a,b)=> b.s - a.s);
-      let bestIdx = scored.length ? scored[0].i : -1;
-      let best = scored.length ? scored[0].s : 0;
-      // If English and low score, translate query to Turkish to match TR questions
-      if (lang === 'en' && (best < 0.20)) {
-        const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-        const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-        if (OPENAI_API_KEY_FAQ) {
-          try {
-            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
-                "Content-Type": "application/json",
-                ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
-              },
-              body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [
-                  { role: "system", content: "Translate the user's question into Turkish only. Return just the translation text." },
-                  { role: "user", content: query }
-                ],
-                temperature: 0.0,
-              }),
-            });
-            if (resp.ok) {
-              const j = await resp.json().catch(()=>null);
-              const trQ = j?.choices?.[0]?.message?.content?.trim();
-              if (trQ) {
-                const nqTr = normalizeText(trQ, 'tr');
-                scored = cand.map((x, i) => ({ i, s: similarity(nqTr, normalizeText(x.q, 'tr')) }))
-                  .sort((a,b)=> b.s - a.s);
-                bestIdx = scored.length ? scored[0].i : -1;
-                best = scored.length ? scored[0].s : 0;
-              }
-            }
-          } catch {}
-        }
-      }
-      if (bestIdx >= 0 && best >= 0.20) {
-        const base = needWifiKiosk ? cand : faq;
-        const item = base[bestIdx];
-        const ansRaw = (lang === 'en' ? (item.a_en || '') : item.a).trim();
-        if (ansRaw) {
-          return Response.json({ answer: ansRaw, matches: [], nluProvider: "faq-csv", faq: { score: best, q: (lang==='en' ? (item.q_en || item.q) : item.q) } });
-        }
-        // If English requested but only Turkish answer exists, translate it
-        if (lang === 'en' && (item.a || '').trim()) {
-          const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-          const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-          if (OPENAI_API_KEY_FAQ) {
-            try {
-              const system = "Translate the following Turkish answer into clear, concise English. Do not add extra information.";
-              const userMsg = item.a;
-              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                  "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
-                  "Content-Type": "application/json",
-                  ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
-                },
-                body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ], temperature: 0.1 }),
-              });
-              if (resp.ok) {
-                const j = await resp.json().catch(()=>null);
-                const content = j?.choices?.[0]?.message?.content?.trim();
-                if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-translate", faq: { score: best, q: (item.q_en || item.q) } });
-              }
-            } catch {}
-          }
-        }
-        // Answer is empty in CSV/Sheet: ask OpenAI to produce a concise answer
-        const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-        const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-        if (OPENAI_API_KEY_FAQ) {
-          try {
-            const system = lang === "tr"
-              ? "İstanbul Havalimanı genel danışma asistanısın. Kullanıcının sorusuna kısa, net ve doğru bir cevap ver. Uydurma bilgi verme. Bilgin yoksa kibarca belirt ve ilgili sayfayı öner."
-              : "You are an Istanbul Airport assistant. Provide a short, accurate answer. If unsure, say so politely and suggest the relevant page.";
-            const userMsg = query;
-            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
-                "Content-Type": "application/json",
-                ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
-              },
-              body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ], temperature: 0.1, max_tokens: 120 }),
-            });
-            if (resp.ok) {
-              const j = await resp.json().catch(()=>null);
-              const content = j?.choices?.[0]?.message?.content?.trim();
-              if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-openai-empty", faq: { score: best, q: (lang==='en' ? (item.q_en || item.q) : item.q) } });
-            }
-          } catch {}
-        }
-        // last resort
-      }
-    }
-  } catch {}
-
-  // 0-b) If forced, route ALL questions directly to OpenAI and return
-  const OPENAI_ONLY = String(process.env.OPENAI_ONLY || "").toLowerCase() === "true";
-  const OPENAI_API_KEY_DIRECT = process.env.OPENAI_API_KEY?.trim();
-  const OPENAI_PROJECT_ID_DIRECT = process.env.OPENAI_PROJECT_ID?.trim();
-  if (OPENAI_ONLY && OPENAI_API_KEY_DIRECT) {
-    try {
-      // Gather flight candidates from live data to give OpenAI concrete facts
-      const stripLite = (s: string) => s.toLowerCase().normalize("NFD").replace(/\p{Diacritic}/gu, "").replace(/[^a-z0-9\s]/gi, " ").replace(/\s+/g, " ").trim();
-      const trBase = (w: string) => w
-        // common Turkish case/postposition endings
-        .replace(/^(?:istanbul\s+)?havalimani$/,'ist')
-        .replace(/'(?:de|da|den|dan|e|a|ye|ya)$/,'')
-        .replace(/(?:lerde|larda|lerden|lardan|lere|lara|de|da|den|dan|e|a|ye|ya)$/,'')
-        .replace(/^(.*?)(?:\s+ucus|\s+uçuş)$/,'$1')
-        .replace(/[^a-z0-9]+/g,'')
-      ;
-      const norm = stripLite(query);
-      const stop = new Set([
-        "ne","zaman","when","time","flight","ucus","uçuş","ucusu","uçuşu","ucuslar","uçuşlar",
-        "to","from","is","the","today","bugun","bugün","yarin","yarın","saat","kacta","kaçta",
-        "var","mi","mı","mu","mü","miyim","miyim?","midir","nedir","hangi","ne zaman"
-      ]);
-      const rawToks = norm.split(" ").filter(w => w.length >= 3 && !stop.has(w));
-      const toks = rawToks.map(trBase).filter(Boolean);
-      const wantArr = /(arrival|arrive|arriving|gelen|varis|varış)/.test(norm);
-      const wantDep = /(departure|depart|giden|kalkis|kalkış)/.test(norm);
-
-      let candidates: Flight[] = await loadLiveFlights(true);
-      if (!candidates.length) {
-        candidates = (await fetchFlightsFromDb()).length ? await fetchFlightsFromDb() : staticFlights;
-      }
-      // Build city vocabulary to pick a better cityHint
-      const cityVocab = new Set<string>();
-      for (const f of candidates) {
-        cityVocab.add(trBase(stripLite(f.originCity)));
-        cityVocab.add(trBase(stripLite(f.destinationCity)));
-      }
-      let cityHint = toks.reverse().find(t => cityVocab.has(t));
-      if (!cityHint) cityHint = toks.slice(-1)[0];
-      // Basic filtering
-      if (wantArr || wantDep) candidates = candidates.filter(f => f.direction === (wantArr ? "Arrival" : "Departure"));
-      if (cityHint || toks.length) {
-        candidates = candidates.filter(f => {
-          const oc = trBase(stripLite(f.originCity));
-          const dc = trBase(stripLite(f.destinationCity));
-          const cc = [oc, dc].join(" ");
-          const tokenHits = toks.filter(t => t && cc.includes(t)).length;
-          if (cityHint && (oc.includes(cityHint) || dc.includes(cityHint))) return true;
-          // relax: at least one meaningful token should match
-          return tokenHits >= 1;
-        });
-      }
-      // Sort by upcoming soonest
-      candidates = candidates.sort((a,b) => {
-        try { return new Date(a.scheduledTimeLocal).getTime() - new Date(b.scheduledTimeLocal).getTime(); } catch { return 0; }
-      }).slice(0, 50);
-
-      const fmtTime = (s?: string) => { try { return s ? new Date(s).toLocaleTimeString(lang === "tr" ? "tr-TR" : "en-US", {hour:"2-digit", minute:"2-digit"}) : ""; } catch { return s||""; } };
-      const facts = candidates.map((f,i)=>`[${i+1}] ${f.flightNumber} ${(f.direction === "Arrival" ? f.originCity : f.destinationCity)} ${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal?` / ${fmtTime(f.estimatedTimeLocal)}`:""}${f.direction === "Departure" ? (f.gate?`, Gate ${f.gate}`:"") : (f.baggage?`, ${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}`:"")} — ${f.status}`).join("\n");
-
-      const system = lang === "tr"
-        ? "İstanbul Havalimanı için konuşan bir asistansın. UÇUŞ BİLGİLERİ listesini GERÇEK kaynak olarak kullan.\n- Bir eşleşme varsa: tek cümlede saat/kapı/durum ver.\n- Birden fazla eşleşme varsa: tümünü satır satır listele (kısa).\n- Eşleşme yoksa: kibarca belirt ve ilgili sayfayı öner."
-        : "You are an assistant for Istanbul Airport. Use FLIGHT FACTS as ground truth. If exactly one match: one concise sentence with time/gate/status. If multiple: list ALL matches line by line (short). If none: say so politely; do not fabricate.";
-      const userMsg = facts ? `${query}\n\nFLIGHT FACTS:\n${facts}` : query;
-
-      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${OPENAI_API_KEY_DIRECT}`,
-          "Content-Type": "application/json",
-          ...(OPENAI_PROJECT_ID_DIRECT ? { "OpenAI-Project": OPENAI_PROJECT_ID_DIRECT } : {}),
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-          temperature: 0.1,
-          max_tokens: 120,
-        }),
-      });
-      if (resp.ok) {
-        const j = await resp.json().catch(()=>null);
-        const content = j?.choices?.[0]?.message?.content?.trim();
-        if (content) return Response.json({ answer: content, matches: candidates, nluProvider: "openai" });
-      }
-    } catch {}
-    // If direct OpenAI failed, continue to normal logic
   }
 
   // 1) Try NLU providers concurrently: Groq || Rules (pick first available)
@@ -542,253 +267,79 @@ export async function POST(req: NextRequest) {
     } catch { return html; }
   }
 
-  // If no clear flight intent, do lightweight RAG over IST pages
-  // If query clearly refers to general topics, never treat as flight
+  // If no clear flight intent, route ALL general questions to Groq
+  // Guard: typical general topics signal (not mandatory, just heuristic)
   const generalGuard = /(bagaj|bavul|otopark|havaist|taksi|otob[uü]s|wifi|wi\-?fi|loung[e]?|harita|rehber|sss|sıkça|adres|konum|nerede|duty\s?free|ma[gğ]aza|yeme|i[cç]e|restoran)/i.test(query);
   const looksLikeFlight = /\b[a-z]{2}\s?\d{2,4}\b/i.test(normalized) || hasFlightKeywords;
-
-  // Location intent quick answer (avoid flight branch)
-  const isLocationQ = /(nerede|adres|konum|nasil giderim|nasıl giderim|where is|address|location)/i.test(query);
-  if (isLocationQ) {
-    const addrTr = "İstanbul Havalimanı (IST) adresi: Tayakadın, Terminal Caddesi No:1, 34283 Arnavutköy/İstanbul";
-    const addrEn = "Istanbul Airport (IST) address: Tayakadin, Terminal Caddesi No:1, 34283 Arnavutkoy/Istanbul, Türkiye";
-    const sources = [
-      "https://www.istairport.com/ulasim/",
-      "https://maps.app.goo.gl/qe3b1Zz6YtJw3J7b8",
-    ];
-    const answer = lang === "tr"
-      ? `${addrTr}\n\nUlaşım: Havaist, taksi ve otobüs hatları için 'Ulaşım' sayfasına bakabilirsiniz.\n\nKaynaklar:\n- Ulaşım: ${sources[0]}\n- Harita: ${sources[1]}`
-      : `${addrEn}\n\nTransport: See 'Transportation' page for Havaist shuttles, taxis and buses.\n\nSources:\n- Transport: ${sources[0]}\n- Map: ${sources[1]}`;
-    return Response.json({ answer, matches: [], nluProvider: nluProvider ?? "rules" });
+  // Eğer genel konulara (duty free, lounge, otopark vb.) işaret eden ifadeler varsa,
+  // uçuş anahtar kelimeleri geçse bile önce Groq'a yönlendir.
+  if (generalGuard) {
+    try {
+      const faq = await loadFAQ().catch(() => [] as FaqItem[]);
+      const nq = normalizeText(query, lang);
+      const scoredFaq = (faq || [])
+        .map((x, i) => ({ i, s: similarity(nq, normalizeText(lang === 'en' ? (x.q_en || x.q) : x.q, lang)) }))
+        .sort((a,b)=> b.s - a.s);
+      const coreFacts = scoredFaq.slice(0, 8)
+        .map(({ i }, k) => `[${k+1}] ${faq[i].q}\n${faq[i].a}`)
+        .join("\n\n");
+      const context = `\nİstanbul Havalimanı (IST), Türkiye’nin en büyük uluslararası havalimanıdır.\nHem iç hat hem de dış hat uçuşları bulunur.\nTerminal 1 genellikle dış hatlar, iç hatlar terminali ise yurt içi seferler için kullanılır.\nHavalimanında restoranlar, mağazalar, ibadet alanları (mescit), çocuk oyun alanları, lounge hizmetleri, otopark, taksi, Havaist otobüsleri ve duty free mağazaları mevcuttur.\n`;
+      const facts = `${context}\n\n${coreFacts}`;
+      try { console.log("🧠 Groq facts length:", facts.length); } catch {}
+      const groqAnswer = await groqChatSmart({ question: query, facts, language: effLang });
+      try { console.log("🧠 Groq output:", groqAnswer ? groqAnswer.slice(0, 120) : ""); } catch {}
+      if (groqAnswer) {
+        return Response.json({ answer: groqAnswer, matches: [], nluProvider: "groq" });
+      }
+    } catch (e) {
+      try { console.error("🔹 Groq general error:", e); } catch {}
+    }
+    // Groq cevap üretemezse, mevcut akışa devam (gerekirse uçuş filtresi dener)
   }
   if (!looksLikeFlight) {
-    // 0) Try fast FAQ CSV answer
     try {
-      const faq = await loadFAQ();
-      if (faq.length) {
-        const nq = normalizeText(query, lang);
-        const scored = faq.map((x, i) => ({ i, s: similarity(nq, normalizeText(lang === 'en' ? (x.q_en || x.q) : x.q, lang)) }))
-          .sort((a,b)=> b.s - a.s);
-        const bestIdx = scored.length ? scored[0].i : -1;
-        const best = scored.length ? scored[0].s : 0;
-        if (bestIdx >= 0 && best >= 0.20) {
-          const item = faq[bestIdx];
-          const ansRaw = (lang === 'en' ? (item.a_en || '') : item.a).trim();
-          if (ansRaw) {
-            return Response.json({ answer: ansRaw, matches: [], nluProvider: "faq-csv", faq: { score: best, q: (lang === 'en' ? (item.q_en || item.q) : item.q) } });
-          }
-          if (lang === 'en' && (item.a || '').trim()) {
-            const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-            const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-            if (OPENAI_API_KEY_FAQ) {
-              try {
-                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                  method: "POST",
-                  headers: { "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`, "Content-Type": "application/json", ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}) },
-                  body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: "Translate the following Turkish answer into clear, concise English. Do not add or remove information. Preserve line breaks." }, { role: "user", content: item.a } ], temperature: 0.1, max_tokens: 120 })
-                });
-                if (resp.ok) {
-                  const j = await resp.json().catch(()=>null);
-                  const content = j?.choices?.[0]?.message?.content?.trim();
-                  if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-translate", faq: { score: best, q: (item.q_en || item.q) } });
-                }
-              } catch {}
-            }
-            return Response.json({ answer: item.a, matches: [], nluProvider: "faq-tr-fallback", faq: { score: best, q: item.q } });
-          }
-        }
-        // Weak match policy:
-        // - For EN queries: do NOT compose an answer from facts. Pick the best FAQ and translate its TR answer deterministically.
-        // - For TR queries: allow FACTS-based phrasing as before.
-        if (lang === 'en' && scored.length) {
-          const bestIdx2 = scored[0].i;
-          const item = faq[bestIdx2];
-          const trAns = (item.a || '').trim();
-          if (trAns) {
-            const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-            const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-            if (OPENAI_API_KEY_FAQ) {
-              try {
-                const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                  method: "POST",
-                  headers: { "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`, "Content-Type": "application/json", ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}) },
-                  body: JSON.stringify({ model: "gpt-4o-mini", messages: [ { role: "system", content: "Translate the following Turkish answer into clear, concise English. Do not add or remove information. Preserve line breaks." }, { role: "user", content: trAns } ], temperature: 0.0 })
-                });
-                if (resp.ok) {
-                  const j = await resp.json().catch(()=>null);
-                  const content = j?.choices?.[0]?.message?.content?.trim();
-                  if (content) return Response.json({ answer: content, matches: [], nluProvider: "faq-translate-weak", faq: { q: item.q } });
-                }
-              } catch {}
-            }
-            // If translation not possible, return TR answer as-is
-            return Response.json({ answer: trAns, matches: [], nluProvider: "faq-tr-fallback", faq: { q: item.q } });
-          }
-        } else {
-          const OPENAI_API_KEY_FAQ = process.env.OPENAI_API_KEY?.trim();
-          const OPENAI_PROJECT_ID_FAQ = process.env.OPENAI_PROJECT_ID?.trim();
-          if (OPENAI_API_KEY_FAQ && scored.length) {
-            const topFacts = scored.slice(0, 3).map(({i},k)=>`[${k+1}] Q: ${faq[i].q}\nA: ${faq[i].a}`).join("\n\n");
-            const system = lang === "tr"
-              ? "İstanbul Havalimanı genel danışma asistanısın. Aşağıdaki FAQ FACTS verilerini temel alarak kısa ve net bir cevap oluştur. Sadece verilen bilgilerden yararlan, uydurma bilgi verme."
-              : "You are an Istanbul Airport assistant. Using only the FAQ FACTS below, produce a short, accurate answer. Do not fabricate.";
-            const userMsg = `${query}\n\nFAQ FACTS:\n${topFacts}`;
-            try {
-              const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-                method: "POST",
-                headers: {
-                  "Authorization": `Bearer ${OPENAI_API_KEY_FAQ}`,
-                  "Content-Type": "application/json",
-                  ...(OPENAI_PROJECT_ID_FAQ ? { "OpenAI-Project": OPENAI_PROJECT_ID_FAQ } : {}),
-                },
-                body: JSON.stringify({
-                  model: "gpt-4o-mini",
-                  messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-                  temperature: 0.1,
-                }),
-              });
-              if (resp.ok) {
-                const j = await resp.json().catch(()=>null);
-                const content = j?.choices?.[0]?.message?.content?.trim();
-                if (content) {
-                  return Response.json({ answer: content, matches: [], nluProvider: "faq-openai" });
-                }
-              }
-            } catch {}
-          }
-        }
+      const faq = await loadFAQ().catch(() => [] as FaqItem[]);
+      const nq = normalizeText(query, lang);
+      const scoredFaq = (faq || [])
+        .map((x, i) => ({ i, s: similarity(nq, normalizeText(lang === 'en' ? (x.q_en || x.q) : x.q, lang)) }))
+        .sort((a,b)=> b.s - a.s);
+      // CSV + Sheet verilerinden en alakalı 8 soru + genel İstanbul Havalimanı bilgisi birleştirilir
+      const coreFacts = scoredFaq.slice(0, 8)
+        .map(({ i }, k) => `[${k+1}] ${faq[i].q}\n${faq[i].a}`)
+        .join("\n\n");
+      const context = `\nİstanbul Havalimanı (IST), Türkiye’nin en büyük uluslararası havalimanıdır.\nHem iç hat hem de dış hat uçuşları bulunur.\nTerminal 1 genellikle dış hatlar, iç hatlar terminali ise yurt içi seferler için kullanılır.\nHavalimanında restoranlar, mağazalar, ibadet alanları (mescit), çocuk oyun alanları, lounge hizmetleri, otopark, taksi, Havaist otobüsleri ve duty free mağazaları mevcuttur.\n`;
+      const facts = `${context}\n\n${coreFacts}`;
+      try { console.log("🧠 Groq facts length:", facts.length); } catch {}
+      const groqAnswer = await groqChatSmart({ question: query, facts, language: effLang });
+      try { console.log("🧠 Groq output:", groqAnswer ? groqAnswer.slice(0, 120) : ""); } catch {}
+      if (groqAnswer) {
+        return Response.json({ answer: groqAnswer, matches: [], nluProvider: "groq" });
       }
-    } catch {}
-    // Cache check
-    const cacheKey = `${lang}|${strip(query)}`;
-    const cached = ragCache.get(cacheKey);
-    if (cached && Date.now() - cached.at < DAY_MS) {
-      return Response.json({ answer: cached.answer, matches: [], nluProvider: nluProvider ?? "rag-cache" });
+    } catch (e) {
+      try { console.error("🔹 Groq path error:", e); } catch {}
     }
-    try {
-      const normQ = strip(query);
-      const terms = normQ.split(" ").filter(w => w.length > 2);
-      const topicBoost = /(bagaj|bavul|otopark|havaist|wifi|loung|check|harita|rehber|sss|sikca|sıkça)/.test(normQ) ? 1 : 0;
-      function variants(t: string): string[] {
-        const base = t.replace(/(lari|leri|larin|lerin|larda|lerde|dan|den|e|a|i|ı|u|ü|y|nin|nın|nun|nün)$/,'');
-        const uniq = new Set([t, base, base.replace(/(li|lı|lu|lü)$/,'')]);
-        return [...uniq].filter(Boolean) as string[];
-      }
-      type Hit = { score: number; snippet: string; url: string; title?: string };
-      const hits: Hit[] = [];
-      // Fetch a subset in parallel (cap to 8 for speed)
-      const pages = IST_ALLOWED_PAGES.slice(0, 4);
-      const resps = await Promise.allSettled(
-        pages.map(p => fetch(p.url, { cache: "no-store" })
-          .then(r => r.text())
-          .then(t => ({ html: t, url: p.url, title: p.title }))
-        )
-      );
-      for (const r of resps) {
-        if (r.status !== "fulfilled") continue;
-        const { html, url, title } = r.value as { html: string; url: string; title?: string };
-        const text = html
-          .replace(/<script[\s\S]*?<\/script>/gi, " ")
-          .replace(/<style[\s\S]*?<\/style>/gi, " ")
-          .replace(/<[^>]+>/g, " ")
-          .replace(/\s+/g, " ")
-          .trim();
-        const norm = text.toLowerCase();
-        const chunks = text.split(/(?<=[.!?])\s+/u).slice(0, 600);
-        for (const ch of chunks) {
-          // term scoring: fuzzy Turkish endings
-          let matchCount = 0; let score = 0;
-          for (const t of terms) {
-            if (!t) continue;
-            const vars = variants(t);
-            if (vars.some(v => v && (norm.includes(v) || norm.startsWith(v)))) {
-              matchCount++; score += 2;
-            }
-          }
-          // URL/title relevance boosts (and topic-specific boosts)
-          const meta = (url + ' ' + (title||'')).toLowerCase();
-          if (/ulasim|otopark|wifi|bagaj|kayıp|lost|lounge|check|harita|yeme|magaza|duty|sss|sikca|sıkça/.test(meta)) score += 2;
-          if (/(bagaj|bavul)/.test(norm)) score += 2;
-          score += topicBoost; // slight global boost when topic words exist in query
-          // downrank homepage heavily
-          if (/^https:\/\/www\.istairport\.com\/?$/.test(url)) score -= 4;
-          if (matchCount >= Math.min(2, terms.length)) {
-            hits.push({ score, snippet: ch.trim().slice(0, 400), url, title });
-          }
-        }
-      }
-      // Deduplicate by snippet and url
-      const uniq: Hit[] = [];
-      const seen = new Set<string>();
-      for (const h of hits.sort((a,b)=> b.score - a.score)) {
-        const key = h.url + '|' + h.snippet.slice(0,120);
-        if (seen.has(key)) continue;
-        seen.add(key); uniq.push(h);
-      }
-      const top = uniq.slice(0, 4);
-      if (top.length) {
-        const answerText = top.map(h => `• ${h.snippet}`).join("\n\n");
-        const srcSeen = new Set<string>();
-        const sources = top
-          .filter(h => { if (srcSeen.has(h.url)) return false; srcSeen.add(h.url); return true; })
-          .map(h => `- ${h.title ?? "Kaynak"}: ${h.url}`).join("\n");
-        let answer = lang === "tr"
-          ? `${answerText}\n\nKaynaklar:\n${sources}`
-          : `${answerText}\n\nSources:\n${sources}`;
-
-        // Synthesize with OpenAI if key exists
-
-        // Optional: Synthesize with OpenAI if key exists
-        const OPENAI_API_KEY = process.env.OPENAI_API_KEY?.trim();
-        const OPENAI_PROJECT_ID = process.env.OPENAI_PROJECT_ID?.trim();
-        if (OPENAI_API_KEY) {
-          try {
-            const system = lang === "tr"
-              ? "Aşağıdaki pasajlardan yararlanarak kullanıcı sorusuna kısa, doğru ve kaynaklara referans veren net bir cevap üret. Kaynakları 'Kaynaklar:' başlığı altında madde madde bırak. Uydurma bilgi verme."
-              : "Using the provided passages, produce a short, accurate answer that cites sources under 'Sources:'. Do not fabricate.";
-            const userMsg = `${query}\n\nPASSAGES:\n${top.map((h,i)=>`[${i+1}] ${h.snippet} (${h.url})`).join("\n")}`;
-            const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${OPENAI_API_KEY}`,
-                "Content-Type": "application/json",
-                ...(OPENAI_PROJECT_ID ? { "OpenAI-Project": OPENAI_PROJECT_ID } : {}),
-              },
-              body: JSON.stringify({
-                model: "gpt-4o-mini",
-                messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-                temperature: 0.1,
-                max_tokens: 120,
-              }),
-            });
-            const j = await resp.json().catch(() => null);
-            const content = j?.choices?.[0]?.message?.content?.trim();
-            if (content) answer = content;
-          } catch {}
-        }
-
-        ragCache.set(cacheKey, { at: Date.now(), answer });
-        return Response.json({ answer, matches: [], nluProvider: nluProvider ?? "rag" });
-      }
-      // No passages found: fall back to a brief default
-    } catch {}
-    // As last resort
-    return Response.json({ answer: lang === "tr" ? "Bu konuda bilgi bulamadım. Lütfen sorunuzu farklı ifade edin." : "I couldn't find information on this. Please rephrase your question." });
+    return Response.json({
+      answer: effLang === 'tr' ? 'Bu konuda kesin bilgi bulamadım. Lütfen farklı ifade edin.' : "I couldn't find this information. Please rephrase your question.",
+      matches: [],
+      nluProvider: 'groq-fallback'
+    });
   }
 
-  // 0) Build flight list from ISTAirport live proxy (both directions, domestic & international)
-  async function loadLiveFlights(forceAllScopes: boolean = false, allowCache: boolean = true): Promise<Flight[]> {
-    // Fast path: serve from cache if fresh
-    if (allowCache && liveFlightsCache && (Date.now() - liveFlightsCache.at) < FLIGHT_CACHE_TTL_MS) {
-      return liveFlightsCache.flights;
-    }
+  // Live flights helper (restored)
+  async function loadLiveFlights(forceAllScopes: boolean = false, allowCache: boolean = true, overrideScope?: "domestic" | "international"): Promise<Flight[]> {
     const directions: Array<{ nature: string; direction: FlightDirection }> = [
       { nature: "1", direction: "Departure" },
       { nature: "0", direction: "Arrival" },
     ];
-    const scopes = forceAllScopes ? ["0", "1"] : (scope ? [scope === "international" ? "1" : "0"] : ["0", "1"]); // 0: domestic, 1: international
-
-    // Build parallel tasks for all combinations
+    const effScope = overrideScope ?? scope;
+    const scopes = forceAllScopes
+      ? ["0", "1"]
+      : (effScope === "international" ? ["1"] : effScope === "domestic" ? ["0"] : ["0", "1"]);
+    // Cache yalnızca tüm kapsamlar (both scopes) istendiğinde kullanılmalı.
+    const requestingBothScopes = scopes.length === 2;
+    if (allowCache && requestingBothScopes && liveFlightsCache && (Date.now() - liveFlightsCache.at) < FLIGHT_CACHE_TTL_MS) {
+      return liveFlightsCache.flights;
+    }
     const tasks = directions.flatMap((d) =>
       scopes.map((isInternational) => {
         const body = new URLSearchParams({
@@ -828,8 +379,8 @@ export async function POST(req: NextRequest) {
       })
     );
 
+    try { console.log("🛰️ loadLiveFlights scopes=", scopes.join(",")); } catch {}
     const settled = await Promise.allSettled(tasks);
-    // Merge unique flights via Map in one pass
     const uniqueFlights = Array.from(
       new Map(
         settled
@@ -838,19 +389,30 @@ export async function POST(req: NextRequest) {
           .map((f) => [`${f.flightNumber}-${f.scheduledTimeLocal}-${f.direction}`, f] as const)
       ).values()
     );
+    try { console.log("🛰️ loadLiveFlights fetched=", uniqueFlights.length); } catch {}
+    // Fallback: IST API bazen isInternational="1" için boş döner. Bu durumda her iki kapsamı da çek.
+    if (uniqueFlights.length === 0 && effScope === "international") {
+      try { console.warn("⚠️ International flight data empty — falling back to all scopes..."); } catch {}
+      return await loadLiveFlights(true, false);
+    }
 
-    if (allowCache) {
+    if (allowCache && requestingBothScopes) {
       liveFlightsCache = { at: Date.now(), flights: uniqueFlights };
-      // Background prefetch before TTL expires to keep cache hot
       setTimeout(() => { loadLiveFlights(true, false).catch(() => {}); }, Math.max(1_000, FLIGHT_CACHE_TTL_MS - 60_000));
     }
     return uniqueFlights;
   }
 
   // Parallelize DB + Live and prefer whichever arrives with data
+  // Basit sorgu niyeti: 'dış hat', 'international', 'yurtdışı' vurgusu varsa scope'u international'a zorla
+  const wantsIntlByQuery = /(dış\s*hat|dis\s*hat|international|yurt\s*d[ıi]şı|yurtdışı|abroad)/i.test(query);
+  const effectiveScope: "domestic" | "international" | undefined = wantsIntlByQuery ? "international" : scope;
+  try { console.log("🛰️ request scope=", scope, "effective=", effectiveScope); } catch {}
+
   const [dbRes, liveRes] = await Promise.allSettled([
     fetchFlightsFromDbCached(),
-    loadLiveFlights()
+    // Assistant aramasında her iki kapsamı da çek (cache mevcutsa hızlı döner)
+    loadLiveFlights(true, true)
   ]);
   const dbFlights = dbRes.status === 'fulfilled' ? dbRes.value : [];
   const liveFlights = liveRes.status === 'fulfilled' ? liveRes.value : [];
@@ -858,15 +420,74 @@ export async function POST(req: NextRequest) {
 
   // Fuzzy filter: score on flightNumber, city (origin/dest), airline
   const qFlight = (merged.flightNumber || "").toUpperCase();
-  const qCity = merged.city ? strip(merged.city) : "";
-  const wantDir = wantDirDefault;
+  let qCity = merged.city ? strip(merged.city) : "";
+  const wantDir = merged.type as FlightDirection | undefined;
+  // Infer direction from natural language if not explicitly provided
+  let inferredDir: FlightDirection | undefined = undefined;
+  try {
+    const ql = query.toLowerCase();
+    if (/(\bto\b|gidiş|gidis|kalkış|kalkis|kalkan|giden|depart|departure)/i.test(ql)) inferredDir = "Departure";
+    if (/(\bfrom\b|gelen|varış|varis|iniş|inis|arrive|arrival)/i.test(ql)) inferredDir = "Arrival";
+  } catch {}
+  const preferDir: FlightDirection | undefined = wantDir ?? inferredDir;
   // Build tokens from query to match multi-word cities (e.g., "kocaseyit edremit")
-  const stopWords = new Set(["ucus","ucusu","uclus","ucuslar","uçuş","uçuşu","uçuşlar","ne","zaman","kalkis","kalkış","varis","varış","gelen","giden","gate","kapi","kapı","hangi","mi","mı","mu","mü","when","time","flight","to","from"]);
+  const stopWords = new Set([
+    // TR
+    "ucus","ucusu","uclus","ucuslar","uçuş","uçuşu","uçuşlar","ne","zaman","kalkis","kalkış","varis","varış","gelen","giden","gate","kapi","kapı","hangi","mi","mı","mu","mü","saat","saatte","kac","kaç","nerede","var","mi?",
+    // EN
+    "is","when","what","which","where","time","flight","flights","to","from","the","a","an","at","in","on","of","for","do","does","are","am","pm","today","tomorrow"
+  ]);
   const tokens = normalized.split(" ")
     .filter(w => w.length >= 3 && !stopWords.has(w));
+  // Infer city from IATA codes (common international destinations)
+  const iataToCity: Record<string, string> = {
+    "lhr":"london","lgw":"london","stn":"london","ltn":"london",
+    "cdg":"paris","ory":"paris",
+    "jfk":"newyork","ewr":"newyork","lga":"newyork",
+    "bos":"boston","mia":"miami","sea":"seattle","ord":"chicago","iad":"washington","dca":"washington",
+    "nrt":"tokyo","hnd":"tokyo",
+    "ams":"amsterdam","fra":"frankfurt","muc":"munich","fco":"rome","mxp":"milan","bgy":"milan","lin":"milan",
+    "zrh":"zurich","gva":"geneva","bcn":"barcelona","lyS":"lyon","vko":"moscow","svo":"moscow","dme":"moscow",
+    "rix":"riga","bsl":"basel","mlh":"basel","eap":"basel","tiv":"tivat","lax":"losangeles","sfo":"sanfrancisco"
+  };
+  if (!qCity) {
+    const iata = tokens.find(t => /^[a-z]{3}$/i.test(t));
+    if (iata) {
+      const mapped = iataToCity[iata.toLowerCase()];
+      if (mapped) qCity = mapped;
+    }
+  }
+  // Detect explicit city token in the query (strict)
+  const tokenCityMap: Record<string, string> = {
+    "moskova": "moscow", "moscow": "moscow", "москва": "moscow",
+    "paris": "paris", "parıs": "paris",
+    "london": "london", "londra": "london",
+    "boston": "boston", "miami": "miami", "chicago": "chicago", "seattle": "seattle",
+    "tokyo": "tokyo", "zurich": "zurich", "zürih": "zurich", "geneva":"geneva",
+  };
+  const detectedCityFromTokens = (() => {
+    for (const t of tokens) {
+      const m = tokenCityMap[t];
+      if (m) return m;
+    }
+    return "";
+  })();
+  // City aliases map
+  const aliasMap: Record<string, string> = {
+    "londra":"london","paris":"paris","parıs":"paris","new york":"newyork","newyork":"newyork",
+    "boston":"boston","miami":"miami","seattle":"seattle","chicago":"chicago","washington":"washington",
+    "tokyo":"tokyo","moskova":"moscow","moscow":"moscow","zurich":"zurich","zürih":"zurich","geneva":"geneva",
+    "barselona":"barcelona","barcelona":"barcelona","frankfurt":"frankfurt","munich":"munich","münih":"munich",
+    "roma":"rome","rome":"rome","milan":"milan","milano":"milan","lyon":"lyon","riga":"riga","basel":"basel","tivat":"tivat"
+  };
+  if (qCity && aliasMap[qCity]) qCity = aliasMap[qCity];
+  const domesticCityList = [
+    "istanbul","ankara","izmir","antalya","adana","bursa","gaziantep","kayseri","trabzon","diyarbakir","eskisehir","samsun","van","konya","mersin","kocaeli","izmit","bodrum","mugla","dalaman","ankara esenboga","esenboga","sabiha gokcen","sabiha","hatay","erzurum","erzincan","sivas","malatya","elazig","sanliurfa","urfa","mardin","batman","mus","siirt","kastamonu","sinop","bolu","zonguldak","rize","artvin","ordu","giresun","aydin","tekirdag","edirne","kars","igdir","agri","kütahya","kutahya","balikesir","canakkale","çanakkale","sakarya","duzce","yozgat","kirikkale","kirklareli","kirsehir","nevsehir","aksaray","nigde","afyon","manisa","denizli","isparta","burdur","osmaniye","karaman","bilecik","bingol","bitlis","hakkari"
+  ];
+  const domesticCities = new Set(domesticCityList.map(strip));
   function score(f: Flight): number {
     let s = 0;
-    if (wantDir && f.direction === wantDir) s += 3;
+    if (preferDir && f.direction === preferDir) s += 3;
     if (qFlight) {
       const fn = f.flightNumber.toUpperCase();
       if (fn === qFlight || fn.replace(/\s+/g, "") === qFlight.replace(/\s+/g, "")) s += 6;
@@ -898,13 +519,24 @@ export async function POST(req: NextRequest) {
       const diffH = Math.abs(t - now) / 3600000;
       s += diffH < 2 ? 2 : diffH < 6 ? 1 : 0;
     } catch {}
+    // If user wanted international (effectiveScope), prefer non-domestic other city
+    try {
+      if (effectiveScope === 'international') {
+        const oc = strip(f.originCity);
+        const dc = strip(f.destinationCity);
+        const isIstanbul = (w: string) => w.includes('istanbul');
+        const other = f.direction === 'Departure' ? dc : oc;
+        const otherNorm = strip(other);
+        if (domesticCities.has(otherNorm)) s -= 3; else s += 2;
+      }
+    } catch {}
     return s;
   }
   const scored = allFlights.map(f => ({ f, s: score(f) }));
   const top = scored.filter(x => x.s > 0).sort((a,b) => b.s - a.s).slice(0, 20).map(x => x.f);
-  const prelim = top.length ? top : filterFlights(allFlights, { type: wantDir, city: merged.city, flightNumber: merged.flightNumber });
+  const prelim = top.length ? top : filterFlights(allFlights, { type: preferDir, city: merged.city, flightNumber: merged.flightNumber });
   // Prefer chosen direction first
-  const dirFiltered = wantDir ? prelim.filter(f => f.direction === wantDir) : prelim;
+  const dirFiltered = preferDir ? prelim.filter(f => f.direction === preferDir) : prelim;
   // Prefer earliest upcoming flight(s) by time (>= now - 5m), then fallback to time asc
   const nowTs = Date.now();
   const future = dirFiltered.filter(f => {
@@ -912,21 +544,50 @@ export async function POST(req: NextRequest) {
   }).sort((a,b) => {
     try { return new Date(a.scheduledTimeLocal).getTime() - new Date(b.scheduledTimeLocal).getTime(); } catch { return 0; }
   });
-  let result = (future.length ? future : dirFiltered).slice(0, 50);
+  // If there is no upcoming flight, consider most recent past flight within last 6 hours
+  let result: Flight[];
+  if (future.length) {
+    result = future.slice(0, 50);
+  } else {
+    const recentPast = dirFiltered
+      .map(f => ({ f, t: (()=>{ try { return new Date(f.scheduledTimeLocal).getTime(); } catch { return 0; } })() }))
+      .filter(x => x.t && x.t >= nowTs - 6*60*60*1000 && x.t < nowTs)
+      .sort((a,b) => b.t - a.t)
+      .map(x => x.f)
+      .slice(0, 5);
+    result = recentPast.length ? recentPast : dirFiltered.slice(0, 50);
+  }
 
   // STRICT CITY/TOKEN FILTER: keep only flights that actually match the asked city/tokens
   if (qCity || tokens.length) {
     const filtered = result.filter(f => {
       const oc = strip(f.originCity);
       const dc = strip(f.destinationCity);
-      const cityHit = qCity ? (oc === qCity || dc === qCity || oc.startsWith(qCity) || dc.startsWith(qCity) || oc.includes(qCity) || dc.includes(qCity)) : false;
-      const tokenCount = tokens.reduce((acc,t)=> acc + ((oc.includes(t) || dc.includes(t)) ? 1 : 0), 0);
+      const other = f.direction === 'Departure' ? dc : oc;
+      const otherNorm = strip(other);
+      const cityHit = qCity ? (otherNorm === qCity || otherNorm.startsWith(qCity) || otherNorm.includes(qCity)) : false;
+      const tokenCount = tokens.reduce((acc,t)=> acc + (otherNorm.includes(t) ? 1 : 0), 0);
+      // If we confidently detected a city from tokens (e.g., 'moskova'), require it strictly
+      if (!qCity && detectedCityFromTokens) return otherNorm.includes(detectedCityFromTokens);
       if (qCity && tokens.length >= 2) return cityHit || tokenCount >= 2;
       if (qCity) return cityHit;
       if (tokens.length >= 2) return tokenCount >= 2; // multi-word names need stronger match
       return tokenCount >= 1;
     });
     if (filtered.length) result = filtered;
+  }
+
+  // If user intent indicates international, try to keep only non-domestic counterparts
+  if (effectiveScope === 'international' && result.length) {
+    const intlOnly = result.filter((f) => {
+      const oc = strip(f.originCity);
+      const dc = strip(f.destinationCity);
+      const other = f.direction === 'Departure' ? dc : oc;
+      return !domesticCities.has(strip(other));
+    });
+    if (intlOnly.length) {
+      result = intlOnly;
+    }
   }
 
   // Final fallback: if still empty, relax direction and rely solely on token hits
@@ -952,53 +613,20 @@ export async function POST(req: NextRequest) {
     result = rescored.filter(x => x.s > 0).sort((a,b)=> b.s - a.s).map(x=>x.f).slice(0, 10);
   }
 
+  // If a city was provided but no matches remain, do NOT dump all flights; ask user to refine city.
+  if (result.length === 0 && (qCity || tokens.length)) {
+    return Response.json({
+      answer: lang === "tr" ? "Eşleşen uçuş bulunamadı. Lütfen şehir adını doğru yazarak tekrar deneyin (örn. 'Paris', 'London', 'Boston')." : "No matching flights found. Please check the city name and try again (e.g., 'Paris', 'London', 'Boston').",
+      matches: [],
+      nluProvider: 'flights',
+    });
+  }
+
   if (result.length === 0) {
-    // Graceful fallback: ask OpenAI to answer anyway
-    const OPENAI_API_KEY_FALL = process.env.OPENAI_API_KEY?.trim();
-    const OPENAI_PROJECT_ID_FALL = process.env.OPENAI_PROJECT_ID?.trim();
-    if (OPENAI_API_KEY_FALL) {
-      try {
-        // Build a light candidate list from tokens to help the model (if any)
-        const cand = tokens.length ? allFlights.filter(f => {
-          const oc = strip(f.originCity); const dc = strip(f.destinationCity);
-          return tokens.some(t => oc.includes(t) || dc.includes(t));
-        }).sort((a,b)=>{
-          try { return new Date(a.scheduledTimeLocal).getTime() - new Date(b.scheduledTimeLocal).getTime(); } catch { return 0; }
-        }).slice(0,5) : [];
-        const fmtTimeLocal = (s?: string) => { try { return s ? new Date(s).toLocaleTimeString(lang === "tr" ? "tr-TR" : "en-US", {hour:"2-digit",minute:"2-digit"}) : ""; } catch { return s||""; } };
-        const facts = cand.map((f,i)=>`[${i+1}] ${f.flightNumber} ${(f.direction === "Arrival" ? f.originCity : f.destinationCity)} ${fmtTimeLocal(f.scheduledTimeLocal)}${f.estimatedTimeLocal?` / ${fmtTimeLocal(f.estimatedTimeLocal)}`:""}${f.direction === "Departure" ? (f.gate?`, Gate ${f.gate}`:"") : (f.baggage?`, ${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}`:"")} — ${f.status}`).join("\n");
-        const system = lang === "tr"
-          ? "İstanbul Havalimanı uçuş asistanısın. Kullanıcının sorusunu kibarca yanıtla. Eşleşen sonuç yoksa olası nedenleri (yazım, yön/terminal, tarih) kısa belirt; mümkünse en yakın ilgili uçuşları öner. Uydurma bilgi verme."
-          : "You are an assistant for Istanbul Airport. Politely answer. If no exact match, briefly mention possible reasons (spelling, direction/terminal, date) and suggest the closest relevant flights if available. Do not fabricate.";
-        const userMsg = facts
-          ? `${query}\n\nPOSSIBLE FLIGHTS:\n${facts}`
-          : query;
-        const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Authorization": `Bearer ${OPENAI_API_KEY_FALL}`,
-            "Content-Type": "application/json",
-            ...(OPENAI_PROJECT_ID_FALL ? { "OpenAI-Project": OPENAI_PROJECT_ID_FALL } : {}),
-          },
-          body: JSON.stringify({
-            model: "gpt-4o-mini",
-            messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-            temperature: 0.2,
-          }),
-        });
-        if (resp.ok) {
-          const j = await resp.json().catch(()=>null);
-          const content = j?.choices?.[0]?.message?.content?.trim();
-          if (content) {
-            return Response.json({ answer: content, matches: cand, nluProvider });
-          }
-        }
-      } catch {}
-    }
     return Response.json({
       answer: lang === "tr" ? "Uçuş bulunamadı. Lütfen uçuş numarası veya şehir adını netleştirerek tekrar dener misiniz?" : "No matching flights found. Please try again with a flight number or clearer city name.",
       matches: [],
-      nluProvider,
+      nluProvider: 'flights',
     });
   }
 
@@ -1023,42 +651,9 @@ export async function POST(req: NextRequest) {
         : `Matching flights:\n${lines.join("\n")}\nYou can ask by flight number for a specific one.`)
     : (lang === "tr" ? `Uçuş: ${bestLine}` : `Flight: ${bestLine}`);
 
-  // If OpenAI is available, let it produce the final phrasing using the same flight facts
-  const OPENAI_API_KEY_FLIGHTS = process.env.OPENAI_API_KEY?.trim();
-  const OPENAI_PROJECT_ID_FLIGHTS = process.env.OPENAI_PROJECT_ID?.trim();
-  if (OPENAI_API_KEY_FLIGHTS && !wantsList) {
-    try {
-      const system = lang === "tr"
-        ? "İstanbul Havalimanı uçuş asistanısın. Kullanıcının sorusunu ve UÇUŞ BİLGİLERİ listesini kullanarak tek cümlede net bir yanıt ver. Zamanı HH:MM biçiminde yaz; kapı veya bagaj bilgisini ekle. Uydurma bilgi verme."
-        : "You are an assistant for Istanbul Airport. Using the user's question and the FLIGHT FACTS, produce one concise sentence with the key time/gate/baggage. Do not fabricate.";
-      const facts = result.slice(0, 5).map((f, i) => (
-        `[${i+1}] ${f.flightNumber} ${f.direction === "Arrival" ? f.originCity : f.destinationCity} ` +
-        `${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal ? ` / ${fmtTime(f.estimatedTimeLocal)}` : ""}` +
-        `${f.direction === "Departure" ? (f.gate ? `, Gate ${f.gate}` : "") : (f.baggage ? `, ${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}` : "")} — ${f.status}`
-      )).join("\n");
-      const userMsg = `${query}\n\nFLIGHT FACTS:\n${facts}`;
-      const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${OPENAI_API_KEY_FLIGHTS}`,
-          "Content-Type": "application/json",
-          ...(OPENAI_PROJECT_ID_FLIGHTS ? { "OpenAI-Project": OPENAI_PROJECT_ID_FLIGHTS } : {}),
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          messages: [ { role: "system", content: system }, { role: "user", content: userMsg } ],
-          temperature: 0.2,
-        }),
-      });
-      if (resp.ok) {
-        const j = await resp.json().catch(() => null);
-        const content = j?.choices?.[0]?.message?.content?.trim();
-        if (content) answer = content;
-      }
-    } catch {}
-  }
+  // Keep plain flight phrasing without Azure/OpenAI refinement
 
-  const finalData = { answer, matches: result, nluProvider };
+  const finalData = { answer, matches: result, nluProvider: 'flights' };
   // Store quick cache for repeated queries
   try { quickRespCache.set(quickKey, { at: Date.now(), data: finalData }); } catch {}
   return Response.json(finalData);
