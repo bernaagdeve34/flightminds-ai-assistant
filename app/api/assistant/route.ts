@@ -170,10 +170,12 @@ export async function POST(req: NextRequest) {
         ? `https://${process.env.VERCEL_URL.replace(/\/$/, "")}`
         : new URL(req.url).origin);
 
-  // Quick response cache hit
-  const quickKey = `${lang}|${scope || 'all'}|${query.trim().toLowerCase()}`;
+  // Quick response cache hit (keyed by effective language and normalized query)
+  const normForKey = normalizeText(query, effLang);
+  const quickKey = `${effLang}|${scope || 'all'}|${normForKey}`;
+  try { console.log("⚡ query=", query, " key=", quickKey); } catch {}
   const quickHit = quickRespCache.get(quickKey);
-  if (quickHit && (Date.now() - quickHit.at) < QUICK_RESP_TTL_MS) {
+  if (normForKey.length >= 3 && quickHit && (Date.now() - quickHit.at) < QUICK_RESP_TTL_MS) {
     return Response.json(quickHit.data);
   }
 
@@ -189,7 +191,7 @@ export async function POST(req: NextRequest) {
         ? `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Kapı ${hit.gate}`:''} — ${hit.status}`
         : `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Gate ${hit.gate}`:''} — ${hit.status}`;
       const data = { answer, matches: [hit], nluProvider: 'flights' };
-      quickRespCache.set(quickKey, { at: Date.now(), data });
+      if (normForKey.length >= 3) quickRespCache.set(quickKey, { at: Date.now(), data });
       return Response.json(data);
     }
   }
@@ -655,6 +657,6 @@ export async function POST(req: NextRequest) {
 
   const finalData = { answer, matches: result, nluProvider: 'flights' };
   // Store quick cache for repeated queries
-  try { quickRespCache.set(quickKey, { at: Date.now(), data: finalData }); } catch {}
+  try { if (normForKey.length >= 3) quickRespCache.set(quickKey, { at: Date.now(), data: finalData }); } catch {}
   return Response.json(finalData);
 }
