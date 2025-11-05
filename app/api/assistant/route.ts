@@ -20,6 +20,14 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 // Live flights in-memory cache (speeds up repeated flight queries)
 let liveFlightsCache: { at: number; flights: Flight[] } | null = null;
 const FLIGHT_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+// configurable lookback window for listing flights (default 60 minutes)
+const LOOKBACK_MS = (Number(process.env.FLIGHT_LOOKBACK_MINUTES) || 60) * 60 * 1000;
+
+// --- Begin: Dual-layer cache (RAM + Disk) ---
+const DISK_CACHE_DIR = process.env.NODE_ENV === 'production' ? '/tmp' : process.cwd();
+const DISK_CACHE_PATH = path.join(DISK_CACHE_DIR, "tmp_flights_cache.json");
+// getCachedFlights is defined inside POST where loadLiveFlights is available
+// --- End: Dual-layer cache ---
 
 // DB flights in-memory cache (5 minutes)
 let dbCache: { at: number; flights: Flight[] } | null = null;
@@ -28,6 +36,27 @@ async function fetchFlightsFromDbCached(): Promise<Flight[]> {
   const f = await fetchFlightsFromDb();
   dbCache = { at: Date.now(), flights: f };
   return f;
+}
+// Post-process general (RAG) answers for EN language quirks like Turkish color names
+function postprocessGeneralAnswer(ans: string, lg: 'tr' | 'en'): string {
+  if (!ans || lg !== 'en') return ans;
+  const repl: Array<[RegExp, string]> = [
+    [/\bKırmızı\b/g, 'Red'], [/\bkırmızı\b/g, 'red'],
+    [/\bMor\b/g, 'Purple'],   [/\bmor\b/g, 'purple'],
+    [/\bMavi\b/g, 'Blue'],    [/\bmavi\b/g, 'blue'],
+    [/\bYeşil\b/g, 'Green'],  [/\byeşil\b/g, 'green'],
+    [/\bSarı\b/g, 'Yellow'],  [/\bsarı\b/g, 'yellow'],
+    [/\bTuruncu\b/g, 'Orange'], [/\bturuncu\b/g, 'orange'],
+    [/\bPembe\b/g, 'Pink'],   [/\bpembe\b/g, 'pink'],
+    [/\bSiyah\b/g, 'Black'],  [/\bsiyah\b/g, 'black'],
+    [/\bBeyaz\b/g, 'White'],  [/\bbeyaz\b/g, 'white'],
+    [/\bGri\b/g, 'Gray'],     [/\bgri\b/g, 'gray'],
+    [/\bLacivert\b/g, 'Navy'],[/\blacivert\b/g, 'navy'],
+    [/\bKahverengi\b/g, 'Brown'], [/\bkahverengi\b/g, 'brown']
+  ];
+  let out = ans;
+  for (const [re, to] of repl) out = out.replace(re, to);
+  return out;
 }
 
 // FAQ cache (CSV: genelsorular.csv)
@@ -187,9 +216,10 @@ export async function POST(req: NextRequest) {
     const hit = liveFlightsCache.flights.find(f => f.flightNumber.replace(/\s+/g, "") === compact);
     if (hit) {
       const t = (()=>{ try { return new Date(hit.scheduledTimeLocal).toLocaleTimeString(lang === 'tr' ? 'tr-TR' : 'en-US', {hour:'2-digit', minute:'2-digit'});} catch { return hit.scheduledTimeLocal||''; }})();
+      const statusText = translateStatus(String(hit.status || ""), lang);
       const answer = lang === 'tr'
-        ? `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Kapı ${hit.gate}`:''} — ${hit.status}`
-        : `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Gate ${hit.gate}`:''} — ${hit.status}`;
+        ? `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Kapı ${hit.gate}`:''} — ${statusText}`
+        : `${hit.flightNumber} ${hit.direction === 'Arrival' ? hit.originCity : hit.destinationCity} ${t}${hit.direction==='Departure' && hit.gate ? `, Gate ${hit.gate}`:''} — ${statusText}`;
       const data = { answer, matches: [hit], nluProvider: 'flights' };
       if (normForKey.length >= 3) quickRespCache.set(quickKey, { at: Date.now(), data });
       return Response.json(data);
@@ -291,7 +321,8 @@ export async function POST(req: NextRequest) {
       const groqAnswer = await groqChatSmart({ question: query, facts, language: effLang });
       try { console.log("🧠 Groq output:", groqAnswer ? groqAnswer.slice(0, 120) : ""); } catch {}
       if (groqAnswer) {
-        return Response.json({ answer: groqAnswer, matches: [], nluProvider: "groq" });
+        const out = postprocessGeneralAnswer(groqAnswer, lang);
+        return Response.json({ answer: out, matches: [], nluProvider: "groq" });
       }
     } catch (e) {
       try { console.error("🔹 Groq general error:", e); } catch {}
@@ -408,13 +439,28 @@ export async function POST(req: NextRequest) {
   // Parallelize DB + Live and prefer whichever arrives with data
   // Basit sorgu niyeti: 'dış hat', 'international', 'yurtdışı' vurgusu varsa scope'u international'a zorla
   const wantsIntlByQuery = /(dış\s*hat|dis\s*hat|international|yurt\s*d[ıi]şı|yurtdışı|abroad)/i.test(query);
-  const effectiveScope: "domestic" | "international" | undefined = wantsIntlByQuery ? "international" : scope;
+  let effectiveScope: "domestic" | "international" | undefined = wantsIntlByQuery ? "international" : scope;
   try { console.log("🛰️ request scope=", scope, "effective=", effectiveScope); } catch {}
+
+  // Dual-layer cache helper (inside POST so it can call loadLiveFlights)
+  async function getCachedFlights(): Promise<Flight[]> {
+    const memoryFresh = liveFlightsCache && (Date.now() - liveFlightsCache.at) < FLIGHT_CACHE_TTL_MS;
+    if (memoryFresh) return liveFlightsCache!.flights;
+    try {
+      const json = fs.readFileSync(DISK_CACHE_PATH, "utf8");
+      const data = JSON.parse(json);
+      if (Date.now() - data.at < 30 * 60 * 1000) return data.flights as Flight[];
+    } catch {}
+    const fresh = await loadLiveFlights(true, false);
+    try { fs.writeFileSync(DISK_CACHE_PATH, JSON.stringify({ at: Date.now(), flights: fresh }), "utf8"); } catch {}
+    liveFlightsCache = { at: Date.now(), flights: fresh };
+    return fresh;
+  }
 
   const [dbRes, liveRes] = await Promise.allSettled([
     fetchFlightsFromDbCached(),
     // Assistant aramasında her iki kapsamı da çek (cache mevcutsa hızlı döner)
-    loadLiveFlights(true, true)
+    getCachedFlights()
   ]);
   const dbFlights = dbRes.status === 'fulfilled' ? dbRes.value : [];
   const liveFlights = liveRes.status === 'fulfilled' ? liveRes.value : [];
@@ -487,46 +533,45 @@ export async function POST(req: NextRequest) {
     "istanbul","ankara","izmir","antalya","adana","bursa","gaziantep","kayseri","trabzon","diyarbakir","eskisehir","samsun","van","konya","mersin","kocaeli","izmit","bodrum","mugla","dalaman","ankara esenboga","esenboga","sabiha gokcen","sabiha","hatay","erzurum","erzincan","sivas","malatya","elazig","sanliurfa","urfa","mardin","batman","mus","siirt","kastamonu","sinop","bolu","zonguldak","rize","artvin","ordu","giresun","aydin","tekirdag","edirne","kars","igdir","agri","kütahya","kutahya","balikesir","canakkale","çanakkale","sakarya","duzce","yozgat","kirikkale","kirklareli","kirsehir","nevsehir","aksaray","nigde","afyon","manisa","denizli","isparta","burdur","osmaniye","karaman","bilecik","bingol","bitlis","hakkari"
   ];
   const domesticCities = new Set(domesticCityList.map(strip));
+  // If a clear city is provided and it's not domestic, force international scope for matching preference
+  if (qCity && !domesticCities.has(qCity)) {
+    effectiveScope = 'international';
+  }
   function score(f: Flight): number {
     let s = 0;
-    if (preferDir && f.direction === preferDir) s += 3;
+    // 1) Direction match: more important
+    if (preferDir && f.direction === preferDir) s += 5;
+    // 2) Flight number dominance
     if (qFlight) {
       const fn = f.flightNumber.toUpperCase();
-      if (fn === qFlight || fn.replace(/\s+/g, "") === qFlight.replace(/\s+/g, "")) s += 6;
-      else if (fn.includes(qFlight)) s += 3;
+      if (fn === qFlight || fn.replace(/\s+/g, "") === qFlight.replace(/\s+/g, "")) s += 8;
+      else if (fn.includes(qFlight)) s += 4;
     }
+    // 3) City match
     if (qCity) {
       const oc = strip(f.originCity);
       const dc = strip(f.destinationCity);
-      // şehir eşleşmesini daha katı yapalım
       if (oc === qCity || dc === qCity) s += 5;
-      else if (oc.startsWith(qCity) || dc.startsWith(qCity)) s += 3;
-      else if (oc.includes(qCity) || dc.includes(qCity)) s += 1;
+      else if (oc.includes(qCity) || dc.includes(qCity)) s += 3;
     }
-    // Token-based fuzzy for multi-word/compound names (always apply)
+    // 4) Token-based fuzzy for compound names
     if (tokens.length) {
       const oc = strip(f.originCity);
       const dc = strip(f.destinationCity);
       let hit = 0;
-      for (const t of tokens) {
-        if (oc.includes(t) || dc.includes(t)) hit++;
-      }
-      if (hit >= 2) s += 5; // both parts matched (e.g., kocaseyit + edremit)
-      else if (hit === 1) s += 2;
+      for (const t of tokens) { if (oc.includes(t) || dc.includes(t)) hit++; }
+      if (hit >= 2) s += 5; else if (hit === 1) s += 2;
     }
-    // slight boost for near-time flights (within +/- 6h)
+    // 5) Time proximity: emphasize <= 1h, then <= 3h
     try {
-      const t = new Date(f.scheduledTimeLocal).getTime();
-      const now = Date.now();
-      const diffH = Math.abs(t - now) / 3600000;
-      s += diffH < 2 ? 2 : diffH < 6 ? 1 : 0;
+      const diffH = Math.abs(new Date(f.scheduledTimeLocal).getTime() - Date.now()) / 3600000;
+      if (diffH < 1) s += 4; else if (diffH < 3) s += 2;
     } catch {}
-    // If user wanted international (effectiveScope), prefer non-domestic other city
+    // 6) International preference alignment
     try {
       if (effectiveScope === 'international') {
         const oc = strip(f.originCity);
         const dc = strip(f.destinationCity);
-        const isIstanbul = (w: string) => w.includes('istanbul');
         const other = f.direction === 'Departure' ? dc : oc;
         const otherNorm = strip(other);
         if (domesticCities.has(otherNorm)) s -= 3; else s += 2;
@@ -541,11 +586,16 @@ export async function POST(req: NextRequest) {
   const dirFiltered = preferDir ? prelim.filter(f => f.direction === preferDir) : prelim;
   // Prefer earliest upcoming flight(s) by time (>= now - 5m), then fallback to time asc
   const nowTs = Date.now();
+  // --- Begin: Professional lookback control ---
   const future = dirFiltered.filter(f => {
-    try { return new Date(f.scheduledTimeLocal).getTime() >= nowTs - 5*60*1000; } catch { return true; }
+    try {
+      const t = new Date(f.scheduledTimeLocal).getTime();
+      return t >= nowTs - LOOKBACK_MS; // include flights up to configured lookback (default 1h)
+    } catch { return true; }
   }).sort((a,b) => {
     try { return new Date(a.scheduledTimeLocal).getTime() - new Date(b.scheduledTimeLocal).getTime(); } catch { return 0; }
   });
+  // --- End: Professional lookback control ---
   // If there is no upcoming flight, consider most recent past flight within last 6 hours
   let result: Flight[];
   if (future.length) {
@@ -560,23 +610,30 @@ export async function POST(req: NextRequest) {
     result = recentPast.length ? recentPast : dirFiltered.slice(0, 50);
   }
 
-  // STRICT CITY/TOKEN FILTER: keep only flights that actually match the asked city/tokens
+  // STRICT, STAGED CITY/TOKEN FILTER: exact -> startsWith -> includes
   if (qCity || tokens.length) {
-    const filtered = result.filter(f => {
+    const byStage = (stage: 'exact'|'starts'|'includes') => result.filter(f => {
       const oc = strip(f.originCity);
       const dc = strip(f.destinationCity);
       const other = f.direction === 'Departure' ? dc : oc;
       const otherNorm = strip(other);
-      const cityHit = qCity ? (otherNorm === qCity || otherNorm.startsWith(qCity) || otherNorm.includes(qCity)) : false;
-      const tokenCount = tokens.reduce((acc,t)=> acc + (otherNorm.includes(t) ? 1 : 0), 0);
-      // If we confidently detected a city from tokens (e.g., 'moskova'), require it strictly
       if (!qCity && detectedCityFromTokens) return otherNorm.includes(detectedCityFromTokens);
-      if (qCity && tokens.length >= 2) return cityHit || tokenCount >= 2;
-      if (qCity) return cityHit;
-      if (tokens.length >= 2) return tokenCount >= 2; // multi-word names need stronger match
+      let cityOk = false;
+      if (qCity) {
+        if (stage === 'exact') cityOk = (otherNorm === qCity);
+        else if (stage === 'starts') cityOk = otherNorm.startsWith(qCity);
+        else cityOk = otherNorm.includes(qCity);
+      }
+      const tokenCount = tokens.reduce((acc,t)=> acc + (otherNorm.includes(t) ? 1 : 0), 0);
+      if (qCity && tokens.length >= 2) return cityOk || tokenCount >= 2;
+      if (qCity) return cityOk;
+      if (tokens.length >= 2) return tokenCount >= 2;
       return tokenCount >= 1;
     });
-    if (filtered.length) result = filtered;
+    let stageRes = byStage('exact');
+    if (!stageRes.length) stageRes = byStage('starts');
+    if (!stageRes.length) stageRes = byStage('includes');
+    if (stageRes.length) result = stageRes;
   }
 
   // If user intent indicates international, try to keep only non-domestic counterparts
@@ -636,11 +693,30 @@ export async function POST(req: NextRequest) {
     if (!s) return "";
     try { const d = new Date(s); return d.toLocaleTimeString(lang === "tr" ? "tr-TR" : "en-US", { hour: "2-digit", minute: "2-digit" }); } catch { return s; }
   };
+  function translateStatus(s: string, lg: 'tr' | 'en'): string {
+    if (lg !== 'en') return s;
+    const low = s.toLowerCase();
+    if (/(kap[iı]\s*kapand[ıi])/i.test(low)) return 'Gate Closed';
+    if (/son\s*ça[gğ]r[iı]/i.test(low)) return 'Final Call';
+    if (/(uça[gğ]a|ucag?a)\s*gidiniz/i.test(low)) return 'Proceed to Gate';
+    if (/(kap[iı])\s*kodu/i.test(low)) return 'Gate Code';
+    if (/(gecik|gecikmeli|delay)/i.test(low)) return 'Delayed';
+    if (/(iptal|cancel)/i.test(low)) return 'Cancelled';
+    if (/(zaman[ıi]nda|on\s*time)/i.test(low)) return 'On Time';
+    if (/(erken\s*geli[sş]|early)/i.test(low)) return 'Early';
+    if (/(kap[iı]\s*a[cç][ıi]k)/i.test(low)) return 'Gate Open';
+    if (/(kap[iı]\s*de[gğ][iı]s\w*)/i.test(low)) return 'Gate Changed';
+    if (/(kontuar\s*a[cç][ıi]k)/i.test(low)) return 'Check-in Open';
+    return s;
+  }
+  // Cap result count for clarity
+  if (result.length > 6) result = result.slice(0, 6);
   const lines = result.map((f) => {
     const cityText = f.direction === "Arrival" ? f.originCity : f.destinationCity;
     const gateOrBaggage = f.direction === "Departure" ? (f.gate ? `Gate ${f.gate}` : "") : (f.baggage ? `${lang === "tr" ? "Bagaj" : "Baggage"} ${f.baggage}` : "");
     const timePair = `${fmtTime(f.scheduledTimeLocal)}${f.estimatedTimeLocal ? ` / ${fmtTime(f.estimatedTimeLocal)}` : ""}`;
-    return `${f.flightNumber} ${cityText} ${timePair}${gateOrBaggage ? `, ${gateOrBaggage}` : ""} — ${f.status}`;
+    const statusText = translateStatus(String(f.status || ''), lang);
+    return `${f.flightNumber} ${cityText} ${timePair}${gateOrBaggage ? `, ${gateOrBaggage}` : ""} — ${statusText}`;
   });
   // Varsayılan davranış: eğer birden fazla eşleşme varsa ve kullanıcı belirli bir uçuş numarası sormadıysa listele
   const wantsListExplicit = /listele|list/gi.test(query);

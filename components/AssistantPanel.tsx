@@ -218,46 +218,67 @@ export default function AssistantPanel({ language, scope }: Props) {
 
   return (
     <div
-      className="relative rounded-3xl p-4 text-white shadow-xl min-h-[320px] flex flex-col items-center justify-center gap-4"
+      className="relative rounded-3xl p-6 text-white shadow-2xl min-h-[420px] w-full max-w-xl mx-auto flex flex-col items-center justify-center gap-5"
       style={{
         background: "linear-gradient(135deg, rgba(0,179,164,0.85) 0%, rgba(0,198,215,0.85) 100%)",
       }}
     >
       <div className="text-center">
-        <div className="text-xl font-semibold">{t.heroTitle}</div>
-        <div className="opacity-90 mt-0.5 text-sm">{t.heroSubtitle}</div>
+        <div className="text-2xl font-semibold tracking-wide">{t.heroTitle}</div>
+        <div className="opacity-90 mt-1 text-base">{t.heroSubtitle}</div>
       </div>
       <button
         onClick={startWebSpeech}
-        className={`h-16 w-16 rounded-full flex items-center justify-center shadow-lg transition-transform border ${
-          listening ? "scale-105" : "bg-white"
+        className={`relative h-32 w-32 rounded-full flex items-center justify-center shadow-2xl transition-all border overflow-hidden ${
+          listening ? "ring-4 ring-white/70 scale-105" : "bg-white hover:scale-105"
         }`}
         title={listening ? t.listening : t.micStart}
         style={listening ? { background: "var(--ist-teal)" } : { borderColor: "rgba(0,0,0,0.05)" }}
       >
-        <img
-          src="/yonlendirme1.jpg"
-          alt={t.micStart}
-          width={48}
-          height={48}
-          style={{
-            borderRadius: '9999px',
-            objectFit: 'cover',
-            filter: listening ? 'brightness(0) invert(1)' : 'none'
-          }}
-        />
+        <div className="absolute inset-0 p-8" style={{ animation: 'kaskotFloat 3.8s ease-in-out infinite' }}>
+          <img
+            src="/kaskot.png"
+            alt={t.micStart}
+            style={{
+              width: '100%',
+              height: '100%',
+              objectFit: 'contain',
+              objectPosition: '50% 50%',
+              transform: 'translateX(0px) scale(0.94)',
+              filter: listening ? 'brightness(0) invert(1)' : 'none'
+            }}
+          />
+        </div>
+        <span
+          className={`absolute bottom-4 right-4 h-10 w-10 rounded-full flex items-center justify-center text-white shadow-md ${
+            listening ? "bg-rose-500 animate-pulse" : "bg-emerald-500"
+          }`}
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="h-5 w-5">
+            <path d="M12 14a3 3 0 0 0 3-3V7a3 3 0 1 0-6 0v4a3 3 0 0 0 3 3zm5-3a5 5 0 1 1-10 0H5a7 7 0 0 0 6 6.92V20H9v2h6v-2h-2v-2.08A7 7 0 0 0 19 11h-2z"/>
+          </svg>
+        </span>
       </button>
-      <div className="w-full max-w-md bg-white/15 backdrop-blur-md rounded-2xl p-2.5">
+      <style jsx>{`
+        @keyframes kaskotFloat {
+          0% { transform: translateY(0) rotate(0deg); }
+          25% { transform: translateY(-2px) rotate(-0.6deg); }
+          50% { transform: translateY(0) rotate(0deg); }
+          75% { transform: translateY(2px) rotate(0.6deg); }
+          100% { transform: translateY(0) rotate(0deg); }
+        }
+      `}</style>
+      <div className="w-full max-w-lg bg-white/15 backdrop-blur-md rounded-2xl p-3">
         <div className="flex gap-2">
           <input
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={t.inputPlaceholder}
-            className="flex-1 rounded-lg px-3 py-1.5 bg-white/80 text-gray-900 placeholder-gray-500 focus:outline-none text-sm"
+            className="flex-1 rounded-lg px-3 py-2 bg-white/85 text-gray-900 placeholder-gray-500 focus:outline-none text-base"
           />
           <button
             onClick={() => input && sendQuery(input)}
-            className="px-3 py-1.5 rounded-lg text-white text-sm"
+            className="px-4 py-2 rounded-lg text-white text-sm"
             style={{ background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" }}
           >
             {t.send}
@@ -274,7 +295,7 @@ export default function AssistantPanel({ language, scope }: Props) {
 					<div className="text-xs text-white/90 mt-1.5">{t.queryLabel} {transcript}</div>
 				)}
 			</div>
-			<div className="flex flex-wrap gap-2 justify-center">
+			<div className="flex flex-wrap gap-2.5 justify-center">
 				{t.samplePrompts.map((p, i) => (
 					<button key={i} onClick={() => setInput(p)} className="text-xs px-2.5 py-1 rounded-full bg-white/20 hover:bg-white/25 backdrop-blur border border-white/30">
 						{p}
@@ -282,12 +303,10 @@ export default function AssistantPanel({ language, scope }: Props) {
 				))}
 			</div>
 			{answer && (
-				<div className="text-sm text-white/95 whitespace-pre-wrap border-t border-white/20 pt-2 w-full max-w-md">
+				<div className="text-sm text-white/95 whitespace-pre-wrap border-t border-white/20 pt-3 w-full max-w-lg">
 					{answer}
 				</div>
 			)}
 		</div>
 	);
 }
-
-
