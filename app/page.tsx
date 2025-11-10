@@ -122,32 +122,33 @@ export default function Home() {
           </button>
         </div>
       </header>
-      <main className="container mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 grid grid-cols-1 lg:grid-cols-12 gap-4 sm:gap-6 xl:gap-8 max-w-screen-2xl">
-        <div className="lg:col-span-12 flex items-center justify-center">
-          <div className="mb-4 inline-flex rounded-full overflow-hidden border border-white/60 bg-white/90">
-            <button
-              className={`px-4 py-1.5 text-sm ${scope === "domestic" ? "text-white" : "text-gray-800"}`}
-              style={scope === "domestic" ? { background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" } : {}}
-              onClick={() => setScope("domestic")}
-            >
-              {lang === "tr" ? "İç Hatlar" : "Domestic"}
-            </button>
-            <button
-              className={`px-4 py-1.5 text-sm border-l ${scope === "international" ? "text-white" : "text-gray-800"}`}
-              style={scope === "international" ? { background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" } : {}}
-              onClick={() => setScope("international")}
-            >
-              {lang === "tr" ? "Dış Hatlar" : "International"}
-            </button>
-          </div>
+      {/* Global centered scope toggle */}
+      <section className="w-full flex items-center justify-center py-3">
+        <div className="inline-flex rounded-full overflow-hidden border border-gray-200 bg-white shadow-sm">
+          <button
+            className={`px-4 py-1.5 text-sm ${scope === "domestic" ? "text-white" : "text-gray-800"}`}
+            style={scope === "domestic" ? { background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" } : {}}
+            onClick={() => setScope("domestic")}
+          >
+            {lang === "tr" ? "İç Hatlar" : "Domestic"}
+          </button>
+          <button
+            className={`px-4 py-1.5 text-sm border-l ${scope === "international" ? "text-white" : "text-gray-800"}`}
+            style={scope === "international" ? { background: "linear-gradient(90deg, var(--ist-teal), var(--ist-cyan))" } : {}}
+            onClick={() => setScope("international")}
+          >
+            {lang === "tr" ? "Dış Hatlar" : "International"}
+          </button>
         </div>
-        <div className="lg:col-span-4 lg:self-start">
+      </section>
+      <main className="mx-auto px-4 sm:px-6 lg:px-8 2xl:px-10 py-4 sm:py-6 grid grid-cols-1 lg:grid-cols-12 2xl:grid-cols-14 gap-4 sm:gap-6 xl:gap-8 max-w-screen-2xl 2xl:max-w-[1760px]">
+        <div className="lg:col-span-4 2xl:col-span-5 lg:self-start">
           <RichFlightTable title={t.departures} flights={departures} language={lang} />
         </div>
-        <div className="lg:col-span-4 lg:self-start">
+        <div className="lg:col-span-4 2xl:col-span-4 lg:self-start">
           <AssistantPanel language={lang} scope={scope} />
         </div>
-        <div className="lg:col-span-4 lg:self-start">
+        <div className="lg:col-span-4 2xl:col-span-5 lg:self-start">
           <RichFlightTable title={t.arrivals} flights={arrivals} language={lang} />
         </div>
       </main>

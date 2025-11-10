@@ -1,36 +1,108 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+## Istanbul Airport Flight Assistant
 
-## Getting Started
+Next.js 15 tabanlı, İstanbul Havalimanı uçuş asistanı. Sesle/soruyla sorgulama yapar, canlı uçuş bilgisini gösterir ve SSS (RAG) üzerinden genel konuları yanıtlar.
 
-First, run the development server:
+---
+
+## Hızlı Başlangıç (Lokal)
+
+1) Bağımlılıklar
+
+```bash
+npm install
+```
+
+2) Ortam değişkenleri (.env.local)
+
+```dotenv
+# Lokal geliştirme için önerilir
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
+
+# Uçuş listesini "şu andan geriye" kaç dakika gösterelim? (varsayılan 60)
+FLIGHT_LOOKBACK_MINUTES=60
+
+# (Opsiyonel) SSS sayfası CSV kaynağı (Google Sheets export link)
+# FAQ_SHEET_URL=https://docs.google.com/spreadsheets/.../export?format=csv&gid=0
+
+# (Opsiyonel) RAG için Groq anahtarı; ilgili dosyada kullanıyorsanız ekleyin
+# GROQ_API_KEY=...
+```
+
+3) Geliştirme sunucusu
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Tarayıcı: http://localhost:3000
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+Mikrofon kullanımı için tarayıcıdan izin vermeyi unutmayın.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+---
 
-## Learn More
+## Üretime Dağıtım (Vercel)
 
-To learn more about Next.js, take a look at the following resources:
+1) Environment Variable ayarları
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Production ortamında yalnızca şunu TANIMLAYIN:
+  - `NEXT_PUBLIC_BASE_URL = https://flightminds-ai-assistant.vercel.app` (sonunda "/" yok)
+- Preview ve Development ortamlarında BU DEĞİŞKENİ TANIMLAMAYIN (boş bırakın/siliniz).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+2) Redeploy
 
-## Deploy on Vercel
+- Değişiklikleri kaydettikten sonra Production için Redeploy yapın.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Not: Uygulama server tarafında internal API çağrıları yaparken `thisOrigin` olarak sırasıyla
+`NEXT_PUBLIC_BASE_URL` → `VERCEL_URL` → istek `origin` değerlerini kullanır.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+---
+
+## Özellikler (Özet)
+
+- Canlı Uçuş Bilgisi
+  - İç/Dış hat verisi
+  - Yön (Giden/Gelen) ve şehir eşleşmesi
+  - 1 saat geri bakış penceresi (config: `FLIGHT_LOOKBACK_MINUTES`)
+  - TR/EN statü çevirileri (örn. Kapı Kapandı → Gate Closed, Kontuar Açık → Check‑in Open)
+
+- SSS (RAG)
+  - CSV/Google Sheets kaynağı
+  - TR/EN destekli yanıt üretimi
+  - EN dilinde Türkçe renk adlarının otomatik çevirisi (ör. Kırmızı → Red)
+
+- Önbellek (Cache)
+  - RAM: 5 dk canlı uçuş cache
+  - Disk: 30 dk fallback (Vercel prod: `/tmp` altında)
+
+---
+
+## Sık Karşılaşılan Sorular
+
+- "Vercel Preview'da API yanlış domain'e gidiyor"
+  - Preview/Development ortamlarında `NEXT_PUBLIC_BASE_URL` TANIMLAMAYIN.
+  - Production'da doğru domain kullanın.
+
+- "Google Fonts uyarısı görüyorum"
+  - Ağ erişimi kısıtlıysa bu uyarı çıkabilir. Çalışmayı engellemez.
+  - İsterseniz fontları `public/fonts` altına indirip `next/font/local` kullanabilirsiniz.
+
+---
+
+## Komutlar
+
+```bash
+# Geliştirme
+npm run dev
+
+# Üretim build
+npm run build
+
+# Üretim sunucusu (lokal test)
+npm run start
+```
+
+---
+
+## Lisans
+
+Bu proje kurum içi kullanım içindir. Dış paylaşıma açılmadan önce lisans/depolama politikalarınızı uygulayınız.
